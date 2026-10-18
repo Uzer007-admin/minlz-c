@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.c text
+*.h text
+*.S text
+*.cmake text
+*.go text
+*.py text
+*.md text
+*.txt text
+
+*.zip binary
+*.gz binary
+*.rawsnappy binary
