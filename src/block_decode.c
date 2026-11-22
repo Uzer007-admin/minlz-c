@@ -4,6 +4,14 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 #include "minlz_internal.h"
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+#include "block_decode_repeat.h"
+
+#include <smmintrin.h>
+#include <tmmintrin.h>
+
+int minlz_backend_has_sse41_shuffle(void);
+#endif
 
 #ifndef MINLZ_ENABLE_DECODE_GOASM
 #define MINLZ_ENABLE_DECODE_GOASM 1
@@ -18,7 +26,7 @@
 #endif
 
 #ifndef MINLZ_DECODE_LARGE_RAW_SSE_NT_MIN
-#define MINLZ_DECODE_LARGE_RAW_SSE_NT_MIN (1u << 20)
+#define MINLZ_DECODE_LARGE_RAW_SSE_NT_MIN (2u << 20)
 #endif
 
 #ifndef MINLZ_ENABLE_RAWCOPY_SSE42_XMM
@@ -63,6 +71,12 @@
 
 #ifndef MINLZ_DECODE_1K2K_AVX2_GO_FWD
 #define MINLZ_DECODE_1K2K_AVX2_GO_FWD 1
+#endif
+
+/* Select the decoder implementation; this does not change compression or
+ * the wire format. The checked C parser is faster for small blocks. */
+#ifndef MINLZ_DECODE_GOASM_MIN_BLOCK
+#define MINLZ_DECODE_GOASM_MIN_BLOCK (256u << 10)
 #endif
 
 #ifndef MINLZ_DECODE_GOASM_MAX_BLOCK
@@ -438,6 +452,11 @@ static int minlz_decode_tiny_literal_repeat(uint8_t *dst, size_t dst_len,
                                    length > (size_t)(dst_end - op))) {
                     return 0;
                 }
+                /* An extended COPY1 immediately leaves the tiny parser. */
+                if (length >= 30u && length < (size_t)(src_end - ip) &&
+                    (ip[length] & 0x3fu) == ((15u << 2) | MINLZ_TAG_COPY1)) {
+                    return 0;
+                }
                 minlz_copy_literal_decode(op, ip, length);
                 ip += length;
                 op += length;
@@ -589,6 +608,165 @@ static MINLZ_ALWAYS_INLINE size_t minlz_store_pattern64_decode(uint8_t *dst, siz
 #endif
 }
 
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+static MINLZ_ALWAYS_INLINE void minlz_copy_match_pattern16(uint8_t *dst, size_t offset,
+                                                          size_t length, __m128i pattern) {
+    uint8_t tail[16];
+
+    /* The initial history and four complete periods make one larger
+     * nonoverlapping source prefix for long matches. */
+    if (length >= 512u) {
+        _mm_storeu_si128((__m128i *)(void *)dst, pattern);
+        _mm_storeu_si128((__m128i *)(void *)(dst + offset), pattern);
+        _mm_storeu_si128((__m128i *)(void *)(dst + 2u * offset), pattern);
+        _mm_storeu_si128((__m128i *)(void *)(dst + 3u * offset), pattern);
+        minlz_copy_match_repeated(dst + 4u * offset, 5u * offset, length - 4u * offset);
+        return;
+    }
+
+    /* Moving by one complete period keeps the phase of each vector. */
+    while (length >= 16u) {
+        _mm_storeu_si128((__m128i *)(void *)dst, pattern);
+        dst += offset;
+        length -= offset;
+    }
+    _mm_storeu_si128((__m128i *)(void *)tail, pattern);
+    memcpy(dst, tail, length);
+}
+/* For offsets 9 through 15, the high eight bytes consist of the end of
+ * the period followed by its beginning. Both source loads stay in history. */
+static MINLZ_NOINLINE void minlz_copy_match_sse2(uint8_t *dst, size_t offset, size_t length) {
+    const uint64_t lo = minlz_load64(dst - offset);
+    const unsigned used = (unsigned)(offset - 8u) * 8u;
+    const uint64_t tail = minlz_load64(dst - 8u) >> (64u - used);
+    const uint64_t hi = tail | (lo << used);
+    const __m128i pattern = _mm_set_epi64x((long long)hi, (long long)lo);
+    minlz_copy_match_pattern16(dst, offset, length, pattern);
+}
+
+__attribute__((target("sse4.1,ssse3")))
+static MINLZ_NOINLINE void minlz_copy_match_sse41(uint8_t *dst, size_t offset, size_t length) {
+    const uint8_t *from = dst - offset;
+    const uint64_t lo = minlz_load64(from);
+    const uint64_t hi = minlz_load64(dst - 8u) >> ((16u - offset) * 8u);
+    const __m128i seed = _mm_insert_epi64(_mm_cvtsi64_si128((long long)lo), (long long)hi, 1);
+    const __m128i index = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const __m128i wrapped = _mm_sub_epi8(index, _mm_set1_epi8((char)offset));
+    const __m128i order = _mm_blendv_epi8(wrapped, index, wrapped);
+    const __m128i pattern = _mm_shuffle_epi8(seed, order);
+    minlz_copy_match_pattern16(dst, offset, length, pattern);
+}
+
+/* Build one vector of the 3-, 5-, 6-, or 7-byte period from decoded history. */
+static MINLZ_NOINLINE void minlz_copy_match_short_period(uint8_t *dst, size_t offset, size_t length) {
+    static const struct {
+        uint64_t multiplier;
+        unsigned right_shift, left_shift;
+    } phase[5] = {
+        {UINT64_C(0x0001000001000001), 16u, 8u},
+        {UINT64_C(0x0000000100000001), 0u, 32u},
+        {UINT64_C(0x0000010000000001), 24u, 16u},
+        {UINT64_C(0x0001000000000001), 16u, 32u},
+        {UINT64_C(0x0100000000000001), 8u, 48u}
+    };
+    static const uint8_t step[5] = {15,16,15,12,14};
+    const uint8_t *src = dst - offset;
+    uint64_t seed;
+    if (offset == 3u) {
+        seed = minlz_load16(src) | ((uint64_t)src[2] << 16u);
+    } else {
+        seed = minlz_load32(src) | ((uint64_t)src[4] << 32u);
+        if (offset >= 6u) {
+            seed |= (uint64_t)src[5] << 40u;
+        }
+        if (offset == 7u) {
+            seed |= (uint64_t)src[6] << 48u;
+        }
+    }
+    const size_t index = offset - 3u;
+    /* The nonzero bytes in the multiplier are a whole period apart. */
+    const uint64_t low = seed * phase[index].multiplier;
+    const uint64_t high = (seed >> phase[index].right_shift) | (low << phase[index].left_shift);
+    const __m128i pattern = _mm_set_epi64x((long long)high, (long long)low);
+    const size_t stride = step[offset - 3u];
+    while (length >= 16u) {
+        _mm_storeu_si128((__m128i *)(void *)dst, pattern);
+        dst += stride;
+        length -= stride;
+    }
+    uint8_t tail[16];
+    _mm_storeu_si128((__m128i *)(void *)tail, pattern);
+    minlz_copy_small_decode(dst, tail, length);
+}
+
+#endif
+
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+/* Two complete vectors of the second period are already in registers. */
+static MINLZ_NOINLINE void minlz_copy_overlap64(uint8_t *out, const uint8_t *from, size_t length) {
+    const __m128i a = _mm_loadu_si128((const __m128i *)(const void *)from);
+    const __m128i b = _mm_loadu_si128((const __m128i *)(const void *)(from + 16u));
+    const __m128i c = _mm_loadu_si128((const __m128i *)(const void *)(from + 32u));
+    const __m128i d = _mm_loadu_si128((const __m128i *)(const void *)(from + 48u));
+    _mm_storeu_si128((__m128i *)(void *)out, a);
+    _mm_storeu_si128((__m128i *)(void *)(out + 16u), b);
+    _mm_storeu_si128((__m128i *)(void *)(out + 32u), c);
+    _mm_storeu_si128((__m128i *)(void *)(out + 48u), d);
+    _mm_storeu_si128((__m128i *)(void *)(out + 64u), a);
+    _mm_storeu_si128((__m128i *)(void *)(out + 80u), b);
+    minlz_copy_small_decode(out + 96u, from + 32u, length - 96u);
+}
+
+static MINLZ_NOINLINE void minlz_copy_short_overlap(uint8_t *out, const uint8_t *from,
+                                                    size_t offset, size_t length) {
+    if (offset == 64u) {
+        minlz_copy_overlap64(out, from, length);
+        return;
+    }
+    const size_t rest = length - offset;
+    minlz_copy_65to128_exact_decode(out, from, offset);
+    if (rest <= 64u) {
+        minlz_copy_small_decode(out + offset, from, rest);
+    } else {
+        minlz_copy_65to128_exact_decode(out + offset, from, rest);
+    }
+}
+#endif
+
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+static MINLZ_ALWAYS_INLINE void minlz_copy_history_span(uint8_t *dst, const uint8_t *src, size_t length) {
+    if (length > 128u) {
+        minlz_copy64_decode(dst, src);
+        minlz_copy64_decode(dst + 64u, src + 64u);
+        dst += 128u;
+        src += 128u;
+        length -= 128u;
+    }
+    if (length > 64u) {
+        minlz_copy64_decode(dst, src);
+        dst += 64u;
+        src += 64u;
+        length -= 64u;
+    }
+    minlz_copy_small_decode(dst, src, length);
+}
+
+/* The first period and the remaining prefix both come from decoded history. */
+static MINLZ_NOINLINE void minlz_copy_two_spans(
+    uint8_t *dst, const uint8_t *src, size_t offset, size_t length) {
+    minlz_copy_history_span(dst, src, offset);
+    minlz_copy_history_span(dst + offset, src, length - offset);
+}
+static MINLZ_NOINLINE size_t minlz_decode_two_spans(
+    uint8_t *out, const uint8_t *dst, const uint8_t *dst_end, size_t offset, size_t length) {
+    if (length - offset > offset || offset > (size_t)(out - dst) || length > (size_t)(dst_end - out)) {
+        return 0;
+    }
+    minlz_copy_two_spans(out, out - offset, offset, length);
+    return length;
+}
+#endif
+
 static void minlz_copy_match_slow(uint8_t *out, size_t offset, size_t length);
 
 static MINLZ_ALWAYS_INLINE void minlz_copy_match_hot(uint8_t *out, size_t offset, size_t length) {
@@ -626,6 +804,12 @@ static MINLZ_ALWAYS_INLINE void minlz_copy_match_hot(uint8_t *out, size_t offset
             uint64_t pat = minlz_load64(from);
             i = minlz_store_pattern64_decode(out, length, pat);
         } else if (offset < 8) {
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+            if (length >= 32u) {
+                minlz_copy_match_short_period(out, offset, length);
+                return;
+            }
+#endif
             while (length - i >= 8) {
                 out[i + 0] = out[i + 0 - offset];
                 out[i + 1] = out[i + 1 - offset];
@@ -697,6 +881,13 @@ static MINLZ_ALWAYS_INLINE void minlz_copy_match_fast_decode(uint8_t *out, size_
             return;
         }
     }
+    if (length >= 33u && length <= 48u && offset >= length) {
+        const uint8_t *from = out - offset;
+        minlz_copy16_decode(out, from);
+        minlz_copy16_decode(out + 16u, from + 16u);
+        minlz_copy16_decode(out + length - 16u, from + length - 16u);
+        return;
+    }
     minlz_copy_match_hot(out, offset, length);
 }
 
@@ -733,6 +924,12 @@ static void minlz_copy_match_slow(uint8_t *out, size_t offset, size_t length) {
         memcpy(out, from, length);
         return;
     }
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+    if (offset - 64u <= 32u && length >= offset + 32u && length - offset <= offset) {
+        minlz_copy_short_overlap(out, from, offset, length);
+        return;
+    }
+#endif
 #if defined(MINLZ_HAVE_AVX512) && MINLZ_HAVE_AVX512
     if (length >= 192 && offset >= 64 && minlz_backend_has_avx512()) {
         minlz_copy_match_avx512(out, offset, length);
@@ -746,6 +943,21 @@ static void minlz_copy_match_slow(uint8_t *out, size_t offset, size_t length) {
     }
 #endif
 #if MINLZ_HAVE_INLINE_ASM_AMD64
+    if (offset >= 9u && offset <= 15u && minlz_backend_has_inline_asm_amd64()) {
+        if (minlz_backend_has_sse41_shuffle()) {
+            minlz_copy_match_sse41(out, offset, length);
+        } else {
+            minlz_copy_match_sse2(out, offset, length);
+        }
+        return;
+    }
+    /* The AVX paths handled their eligible matches above. Reuse complete
+     * periods for long overlap copies on the remaining x86 path. */
+    if (length >= 512u && offset >= 3u && offset <= length / 4u &&
+        minlz_backend_has_asm_amd64()) {
+        minlz_copy_match_repeated(out, offset, length);
+        return;
+    }
     if (length >= MINLZ_DECODE_REPMOVSB_OVERLAP_MIN && offset >= 64 &&
         minlz_backend_has_asm_amd64()) {
         minlz_copy_forward_decode(out, from, length);
@@ -773,6 +985,12 @@ static void minlz_copy_match_slow(uint8_t *out, size_t offset, size_t length) {
         uint64_t pat = minlz_load64(from);
         i = minlz_store_pattern64_decode(out, length, pat);
     } else if (offset < 8) {
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+        if (length >= 32u) {
+            minlz_copy_match_short_period(out, offset, length);
+            return;
+        }
+#endif
         while (length - i >= 8) {
             out[i + 0] = out[i + 0 - offset];
             out[i + 1] = out[i + 1 - offset];
@@ -805,6 +1023,95 @@ static void minlz_copy_match_slow(uint8_t *out, size_t offset, size_t length) {
     }
 }
 
+static MINLZ_ALWAYS_INLINE int minlz_decode_blocks_disjoint(
+    const uint8_t *dst, size_t dst_len, const uint8_t *src, size_t src_len) {
+    const uintptr_t d = (uintptr_t)dst;
+    const uintptr_t s = (uintptr_t)src;
+    return d <= s ? s - d >= dst_len : d - s >= src_len;
+}
+
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+#define MINLZ_DECODE_REPEAT8 ((29u << 3) | MINLZ_TAG_REPEAT)
+#define MINLZ_DECODE_REPEAT16 ((30u << 3) | MINLZ_TAG_REPEAT)
+
+static MINLZ_ALWAYS_INLINE void minlz_copy_period64_sse2(uint8_t *dst, size_t length) {
+    const uint8_t *seed = dst - 64u;
+    const __m128i a = _mm_loadu_si128((const __m128i *)(const void *)seed);
+    const __m128i b = _mm_loadu_si128((const __m128i *)(const void *)(seed + 16u));
+    const __m128i c = _mm_loadu_si128((const __m128i *)(const void *)(seed + 32u));
+    const __m128i d = _mm_loadu_si128((const __m128i *)(const void *)(seed + 48u));
+    do {
+        _mm_storeu_si128((__m128i *)(void *)dst, a);
+        _mm_storeu_si128((__m128i *)(void *)(dst + 16u), b);
+        _mm_storeu_si128((__m128i *)(void *)(dst + 32u), c);
+        _mm_storeu_si128((__m128i *)(void *)(dst + 48u), d);
+        dst += 64u;
+        length -= 64u;
+    } while (length >= 64u);
+    minlz_copy_small_decode(dst, seed, length);
+}
+
+/* Consecutive REPEAT commands keep the same offset and therefore extend
+ * the same periodic output. Stop before any unchecked command. */
+static MINLZ_NOINLINE size_t minlz_decode_repeat_run(
+    uint8_t *op, size_t available, const uint8_t **input, const uint8_t *src_end,
+    size_t offset, size_t length) {
+    const uint8_t *ip = *input;
+    size_t total = length;
+    const uint8_t tag = ip[0];
+    const size_t command_size = tag == MINLZ_DECODE_REPEAT16 ? 3u : 2u;
+    while ((size_t)(src_end - ip) >= command_size && ip[0] == tag) {
+        const size_t repeat = 30u + (command_size == 2u ? ip[1] : minlz_load16(ip + 1u));
+        if (repeat > available - total) {
+            break;
+        }
+        total += repeat;
+        ip += command_size;
+    }
+    *input = ip;
+    if (offset == 64u) {
+        minlz_copy_period64_sse2(op, total);
+    } else {
+        minlz_copy_match_repeated(op, offset, total);
+    }
+    return total;
+}
+
+/*
+ * When the previous offset spans one short literal and one repeat, the
+ * repeat in each identical pair reads the very same bytes as its predecessor.
+ * Keep those bytes in registers until the next pair has a different shape.
+ */
+__attribute__((aligned(32)))
+static MINLZ_NOINLINE void minlz_decode_repeat_stride(uint8_t **out, const uint8_t **in,
+                                                     const uint8_t *dst_end, const uint8_t *src_end,
+                                                     size_t literal, size_t length) {
+    uint8_t *op = *out;
+    const uint8_t *ip = *in;
+    const size_t stride = literal + length;
+    const uint8_t literal_tag = (uint8_t)((literal - 1u) << 3);
+    const uint16_t repeat_tag = (uint16_t)(MINLZ_DECODE_REPEAT8 | ((length - 30u) << 8));
+    const uint8_t *prev = op - length;
+    const __m128i first = _mm_loadu_si128((const __m128i *)prev);
+    const __m128i middle = _mm_loadu_si128((const __m128i *)(prev + 16u));
+    const __m128i last = _mm_loadu_si128((const __m128i *)(op - 16u));
+    do {
+        _mm_storeu_si128((__m128i *)op, _mm_loadu_si128((const __m128i *)(ip + 1u)));
+        _mm_storeu_si128((__m128i *)(op + literal), first);
+        _mm_storeu_si128((__m128i *)(op + literal + 16u), middle);
+        _mm_storeu_si128((__m128i *)(op + stride - 16u), last);
+        ip += literal + 3u;
+        op += stride;
+    } while ((size_t)(src_end - ip) >= 19u && (size_t)(dst_end - op) >= stride &&
+             ip[0] == literal_tag && minlz_load16(ip + literal + 1u) == repeat_tag);
+    *out = op;
+    *in = ip;
+}
+#endif
+
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+__attribute__((aligned(32)))
+#endif
 static minlz_status minlz_decode_raw(uint8_t *dst, size_t dst_len,
                                      const uint8_t *src, size_t src_len) {
     if (dst_len >= 256u && dst_len <= (8u << 10) && src_len >= 16u &&
@@ -812,7 +1119,7 @@ static minlz_status minlz_decode_raw(uint8_t *dst, size_t dst_len,
         return MINLZ_OK;
     }
 #if MINLZ_HAVE_INLINE_ASM_AMD64 && MINLZ_ENABLE_DECODE_GOASM
-    if (dst_len >= 256u && dst_len <= MINLZ_DECODE_GOASM_MAX_BLOCK &&
+    if (dst_len >= MINLZ_DECODE_GOASM_MIN_BLOCK && dst_len <= MINLZ_DECODE_GOASM_MAX_BLOCK &&
         src_len >= 16u &&
         !(dst_len > (8u << 10) && dst_len <= (16u << 10)) &&
         !(dst_len >= (256u << 10) && src_len * 400u <= dst_len * 71u &&
@@ -890,6 +1197,27 @@ static minlz_status minlz_decode_raw(uint8_t *dst, size_t dst_len,
                 length = 30u + (minlz_load32(ip) >> 8);
                 ip += 4;
             }
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+            if (v == MINLZ_DECODE_REPEAT8 && length >= 33u && length <= 48u &&
+                offset > length && offset - length <= 16u) {
+                const size_t literal = offset - length;
+                if (offset > (size_t)(op - dst) || length > (size_t)(dst_end - op)) {
+                    return MINLZ_CORRUPT;
+                }
+                if ((size_t)(src_end - ip) >= 19u &&
+                    (size_t)(dst_end - op) - length >= offset &&
+                    ip[0] == (uint8_t)((literal - 1u) << 3) &&
+                    ip[literal + 1u] == MINLZ_DECODE_REPEAT8 &&
+                    ip[literal + 2u] == length - 30u &&
+                    minlz_decode_blocks_disjoint(dst, dst_len, src, src_len) &&
+                    minlz_backend_has_inline_asm_amd64()) {
+                    minlz_copy_match_fast_decode(op, offset, length, dst_end);
+                    op += length;
+                    minlz_decode_repeat_stride(&op, &ip, dst_end, src_end, literal, length);
+                    continue;
+                }
+            }
+#endif
             if (MINLZ_UNLIKELY((v & MINLZ_TAG_REPEAT) != 0)) {
                 goto fast_copy;
             }
@@ -921,6 +1249,11 @@ static minlz_status minlz_decode_raw(uint8_t *dst, size_t dst_len,
             if (MINLZ_UNLIKELY(len_code == 15)) {
                 length = 18u + ip[2];
                 ip += 3;
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+                if (MINLZ_UNLIKELY(length > 64u)) {
+                    goto try_repeat_run;
+                }
+#endif
             } else {
                 length = 4u + len_code;
                 ip += 2;
@@ -945,9 +1278,19 @@ static minlz_status minlz_decode_raw(uint8_t *dst, size_t dst_len,
             if (len_code == 61) {
                 length = 64u + ip[3];
                 ip += 4;
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+                if (MINLZ_UNLIKELY(length > 64u)) {
+                    goto try_repeat_run;
+                }
+#endif
             } else if (len_code == 62) {
                 length = 64u + minlz_load16(ip + 3);
                 ip += 5;
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+                if (MINLZ_UNLIKELY(offset - 64u <= 192u && length > offset)) {
+                    goto try_repeat_run;
+                }
+#endif
             } else {
                 length = 64u + (minlz_load32(ip + 2) >> 8);
                 ip += 6;
@@ -1044,6 +1387,10 @@ fast_copy:
         }
         minlz_copy_match_fast_decode(op, offset, length, dst_end);
         op += length;
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+next_command:
+        ;
+#endif
     }
 
     s = (size_t)(ip - src);
@@ -1187,6 +1534,36 @@ fast_copy:
     }
 
     return d == dst_len ? MINLZ_OK : MINLZ_CORRUPT;
+
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+try_repeat_run:
+    if (length > offset && offset - 64u <= 192u &&
+        (size_t)(src_end - ip) >= 2u &&
+        (ip[0] == MINLZ_DECODE_REPEAT8 ||
+         ((size_t)(src_end - ip) >= 3u && ip[0] == MINLZ_DECODE_REPEAT16)) &&
+        offset <= (size_t)(op - dst) && length <= (size_t)(dst_end - op) &&
+        30u + (ip[0] == MINLZ_DECODE_REPEAT8 ? ip[1] : minlz_load16(ip + 1u)) <=
+            (size_t)(dst_end - op) - length &&
+        minlz_decode_blocks_disjoint(dst, dst_len, src, src_len) &&
+        minlz_backend_has_inline_asm_amd64()) {
+        op += minlz_decode_repeat_run(op, (size_t)(dst_end - op), &ip, src_end, offset, length);
+        goto next_command;
+    }
+    if (offset == 64u && length - 96u <= 32u &&
+        (size_t)(op - dst) >= 64u && length <= (size_t)(dst_end - op)) {
+        minlz_copy_overlap64(op, op - 64u, length);
+        op += length;
+        goto next_command;
+    }
+    if (offset - 128u <= 128u && length > offset) {
+        size_t copied = minlz_decode_two_spans(op, dst, dst_end, offset, length);
+        if (copied != 0u) {
+            op += copied;
+            goto next_command;
+        }
+    }
+    goto fast_copy;
+#endif
 }
 
 minlz_status minlz_payload_decoded_len(const uint8_t *src, size_t src_len,
@@ -1236,12 +1613,30 @@ size_t minlz_max_encoded_len(size_t src_len) {
     return src_len + 2;
 }
 
-minlz_status minlz_decoded_len(const uint8_t *src, size_t src_len, size_t *decoded_len) {
-    const uint8_t *p;
-    size_t n;
-    size_t h;
-    minlz_status st;
+static MINLZ_ALWAYS_INLINE minlz_status minlz_check_block_length(
+    size_t declared, size_t payload_len, size_t *decoded_len) {
+    if (declared > MINLZ_MAX_BLOCK_SIZE) {
+        return MINLZ_TOO_LARGE;
+    }
+    if (payload_len == 0 || (declared != 0 && declared < payload_len)) {
+        return MINLZ_CORRUPT;
+    }
+    *decoded_len = declared == 0 ? payload_len : declared;
+    return MINLZ_OK;
+}
 
+static MINLZ_NOINLINE minlz_status minlz_decoded_len_varint(
+    const uint8_t *src, size_t src_len, size_t *decoded_len) {
+    size_t declared;
+    size_t used;
+    minlz_status status = minlz_read_uvarint(src, src_len, &declared, &used);
+    if (status != MINLZ_OK) {
+        return status;
+    }
+    return minlz_check_block_length(declared, src_len - used, decoded_len);
+}
+
+minlz_status minlz_decoded_len(const uint8_t *src, size_t src_len, size_t *decoded_len) {
     if (!src || !decoded_len || src_len == 0) {
         return MINLZ_CORRUPT;
     }
@@ -1252,27 +1647,16 @@ minlz_status minlz_decoded_len(const uint8_t *src, size_t src_len, size_t *decod
         *decoded_len = 0;
         return MINLZ_OK;
     }
-    p = src + 1;
-    st = minlz_read_uvarint(p, src_len - 1, &n, &h);
-    if (st != MINLZ_OK) {
-        return st;
+
+    /* Raw blocks and small compressed blocks have a short length field. */
+    if (src[1] < 0x80u) {
+        return minlz_check_block_length(src[1], src_len - 2u, decoded_len);
     }
-    if (n > MINLZ_MAX_BLOCK_SIZE) {
-        return MINLZ_TOO_LARGE;
+    if (src_len > 2u && src[2] < 0x80u) {
+        size_t declared = (src[1] & 0x7fu) | ((size_t)src[2] << 7u);
+        return minlz_check_block_length(declared, src_len - 3u, decoded_len);
     }
-    p += h;
-    if ((size_t)(p - src) == src_len) {
-        return MINLZ_CORRUPT;
-    }
-    if (n == 0) {
-        *decoded_len = src_len - (size_t)(p - src);
-        return MINLZ_OK;
-    }
-    if (n < src_len - (size_t)(p - src)) {
-        return MINLZ_CORRUPT;
-    }
-    *decoded_len = n;
-    return MINLZ_OK;
+    return minlz_decoded_len_varint(src + 1u, src_len - 1u, decoded_len);
 }
 
 int minlz_is_block(const uint8_t *src, size_t src_len, size_t *decoded_len) {
@@ -1298,6 +1682,12 @@ static MINLZ_ALWAYS_INLINE minlz_status minlz_decode_uncompressed_8k16k(
         memmove(dst, src + 2u, want);
         return MINLZ_OK;
     }
+#if MINLZ_DECODE_8K16K_PLAIN_MEMCPY
+    /* Honor the plain-copy selection before trying CPU-specific copies.
+     * memmove also preserves the raw-block overlap contract. */
+    memmove(dst, src + 2u, want);
+    return MINLZ_OK;
+#endif
 #if MINLZ_DECODE_8K16K_AVX2_GO_FWD
     if (want == 10000u && minlz_copy_uncompressed_10000_avx2(dst, src + 2u)) {
         return MINLZ_OK;
@@ -1337,11 +1727,12 @@ static MINLZ_NOINLINE int minlz_copy_large_raw_sse_nt(uint8_t *dst,
     size_t prefix;
     size_t blocks;
     size_t tail;
-    if ((backend != MINLZ_BACKEND_SSE42 && backend != MINLZ_BACKEND_ASM_AMD64) ||
-        len < MINLZ_DECODE_LARGE_RAW_SSE_NT_MIN) {
+    if (backend != MINLZ_BACKEND_SSE42 && backend != MINLZ_BACKEND_ASM_AMD64) {
         return 0;
     }
-    prefix = (16u - ((uintptr_t)dst & 15u)) & 15u;
+    /* Fill whole cache lines with streaming stores. A partial line
+     * shared with the memcpy head or tail can stall write combining. */
+    prefix = (64u - ((uintptr_t)dst & 63u)) & 63u;
     if (prefix != 0u) {
         memcpy(dst, src, prefix);
         dst += prefix;
@@ -1452,7 +1843,8 @@ static MINLZ_ALWAYS_INLINE void minlz_copy_large_raw_checked(uint8_t *dst,
      */
     __asm__ volatile("" : "+r"(dst), "+r"(src) : : "memory");
 #endif
-    if (len < MINLZ_DECODE_LARGE_RAW_SSE_NT_MIN) {
+    if (len < MINLZ_DECODE_LARGE_RAW_SSE_NT_MIN ||
+        !minlz_decode_blocks_disjoint(dst, len, src, len)) {
         memmove(dst, src, len);
         return;
     }
@@ -1477,15 +1869,15 @@ static MINLZ_NOINLINE minlz_status minlz_decode_raw_mid_checked(
     __asm__ volatile("" : "+r"(dst), "+r"(payload) : : "memory");
 #endif
 #if MINLZ_DECODE_RAW_MID_MEMCPY_NONOVERLAP
-    {
-        const uintptr_t d = (uintptr_t)dst;
-        const uintptr_t s = (uintptr_t)payload;
-        const int nonoverlap = d <= s ? s - d >= want : d - s >= want;
-        if (nonoverlap) {
-            memcpy(dst, payload, want);
-        } else {
-            memmove(dst, payload, want);
+    if (minlz_decode_blocks_disjoint(dst, want, payload, want)) {
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+        if (want >= (1u << 20) && minlz_copy_large_raw_sse_nt(dst, payload, want)) {
+            return MINLZ_OK;
         }
+#endif
+        memcpy(dst, payload, want);
+    } else {
+        memmove(dst, payload, want);
     }
 #else
     memmove(dst, payload, want);
@@ -1550,17 +1942,6 @@ minlz_status minlz_decode_ws(minlz_workspace *ws, uint8_t *dst, size_t dst_cap,
     if (src && src_len >= 2u && src[0] == 0 && src[1] == 0) {
         size_t want = src_len - 2u;
         if (want >= (8u << 10) && want <= (16u << 10)) {
-            if (want == 10000u && !minlz_backend_has_avx2()) {
-                *dst_len = 10000u;
-                if (10000u > dst_cap) {
-                    return MINLZ_DST_TOO_SMALL;
-                }
-                if (!dst) {
-                    return MINLZ_CORRUPT;
-                }
-                memcpy(dst, src + 2u, 10000u);
-                return MINLZ_OK;
-            }
             return minlz_decode_uncompressed_8k16k(dst, dst_cap, dst_len, src, src_len);
         }
         if (want == 1024u || want == 2048u) {

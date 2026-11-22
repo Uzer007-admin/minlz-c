@@ -273,6 +273,26 @@ size_t minlz_put_uvarint(uint8_t *dst, uint64_t v);
 minlz_status minlz_read_uvarint(const uint8_t *src, size_t src_len, size_t *value, size_t *used);
 size_t minlz_put_varint(uint8_t *dst, int64_t v);
 
+/* Stream sizes and offsets can exceed SIZE_MAX on 32-bit builds. */
+static inline minlz_status minlz_read_uvarint64(const uint8_t *src, size_t src_len,
+                                               uint64_t *value, size_t *used) {
+    uint64_t result = 0;
+    size_t i;
+    for (i = 0u; i < src_len && i < 10u; ++i) {
+        const uint8_t byte = src[i];
+        if (i == 9u && byte > 1u) {
+            return MINLZ_CORRUPT;
+        }
+        result |= (uint64_t)(byte & 0x7fu) << (7u * i);
+        if (byte < 0x80u) {
+            *value = result;
+            *used = i + 1u;
+            return MINLZ_OK;
+        }
+    }
+    return MINLZ_CORRUPT;
+}
+
 uint32_t minlz_crc32c(const uint8_t *src, size_t src_len);
 uint32_t minlz_mask_crc32c(uint32_t crc);
 uint32_t minlz_crc(const uint8_t *src, size_t src_len);

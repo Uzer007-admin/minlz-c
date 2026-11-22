@@ -10,6 +10,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #define CHECK(x) do { \
     if (!(x)) { \
         fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #x); \
@@ -985,6 +991,83 @@ static int test_index_api(void) {
     return 0;
 }
 
+static int test_stream_segment_index(void) {
+    static const uint8_t first[] = "first segment";
+    static const uint8_t second[] = "second segment of a different size";
+    uint8_t empty[] = {
+        MINLZ_CHUNK_STREAM_ID, 6, 0, 0, 'M', 'i', 'n', 'L', 'z', 2,
+        MINLZ_CHUNK_UNCOMPRESSED, 4, 0, 0, 0, 0, 0, 0,
+        MINLZ_CHUNK_EOF, 1, 0, 0, 0
+    };
+    const uint8_t empty_eof[] = {MINLZ_CHUNK_EOF, 1, 0, 0, 0};
+    minlz_stream_options opts;
+    minlz_index *index = NULL;
+    minlz_index_info info;
+    minlz_reader *reader = NULL;
+    test_mem_write wire = {0}, decoded = {0};
+    test_mem_read read = {0};
+    uint8_t *encoded_index = NULL;
+    size_t index_len = 0u;
+    size_t empty_offset;
+    const size_t plain_size = sizeof(first) + sizeof(second);
+
+    minlz_store32(empty + 14, minlz_crc(empty, 0u));
+    CHECK(minlz_index_create(&index) == MINLZ_OK);
+    read.data = empty;
+    read.len = sizeof(empty);
+    CHECK(minlz_index_stream(test_read_cb, &read, &encoded_index, &index_len) == MINLZ_OK);
+    CHECK(minlz_index_load(index, encoded_index, index_len, NULL) == MINLZ_OK);
+    CHECK(minlz_index_info_get(index, &info) == MINLZ_OK);
+    CHECK(info.entries == 0u && info.total_uncompressed == 0 &&
+          info.total_compressed == (int64_t)sizeof(empty));
+    minlz_free(encoded_index);
+
+    minlz_stream_options_init(&opts);
+    opts.add_index = 0;
+    opts.block_size = MINLZ_MIN_BLOCK_SIZE;
+    read.data = first;
+    read.len = sizeof(first);
+    read.pos = 0u;
+    CHECK(minlz_stream_encode(test_read_cb, &read, test_write_cb, &wire, &opts) == MINLZ_OK);
+    empty_offset = wire.len;
+    CHECK(test_write_cb(&wire, empty_eof, sizeof(empty_eof)) == MINLZ_OK);
+    read.data = second;
+    read.len = sizeof(second);
+    read.pos = 0u;
+    CHECK(minlz_stream_encode(test_read_cb, &read, test_write_cb, &wire, &opts) == MINLZ_OK);
+
+    read.data = wire.data;
+    read.len = wire.len;
+    read.pos = 0u;
+    CHECK(minlz_index_stream(test_read_cb, &read, &encoded_index, &index_len) == MINLZ_OK);
+    CHECK(minlz_index_load(index, encoded_index, index_len, NULL) == MINLZ_OK);
+    CHECK(minlz_index_info_get(index, &info) == MINLZ_OK);
+    CHECK(info.total_uncompressed == (int64_t)plain_size &&
+          info.total_compressed == (int64_t)wire.len);
+    minlz_free(encoded_index);
+    minlz_index_destroy(index);
+
+    read.pos = 0u;
+    CHECK(minlz_stream_decode(test_read_cb, &read, test_write_cb, &decoded, &opts) == MINLZ_OK);
+    CHECK(decoded.len == plain_size && memcmp(decoded.data, first, sizeof(first)) == 0 &&
+          memcmp(decoded.data + sizeof(first), second, sizeof(second)) == 0);
+    read.pos = 0u;
+    decoded.len = 0u;
+    opts.threads = 2;
+    CHECK(minlz_reader_create(&reader, test_read_cb, &read, &opts) == MINLZ_OK);
+    CHECK(minlz_reader_write_to(reader, test_write_cb, &decoded, NULL) == MINLZ_OK);
+    CHECK(decoded.len == plain_size && memcmp(decoded.data, first, sizeof(first)) == 0 &&
+          memcmp(decoded.data + sizeof(first), second, sizeof(second)) == 0);
+    minlz_reader_destroy(reader);
+
+    wire.data[empty_offset + 4u] = 1u;
+    read.pos = 0u;
+    CHECK(minlz_index_stream(test_read_cb, &read, &encoded_index, &index_len) == MINLZ_CORRUPT);
+    free(decoded.data);
+    free(wire.data);
+    return 0;
+}
+
 static int test_reader_writer_api(void) {
     uint8_t src[9000];
     uint8_t out[64];
@@ -1607,9 +1690,9 @@ static int test_sidecar_forward_case(
               test_read_at_cb, &main_read,
               test_read_cb, &sidecar_read) == MINLZ_OK);
     CHECK(minlz_sidecar_searcher_search(
-              searcher, pattern, pattern_len,
-              test_forward_match_cb, &matches) == MINLZ_OK);
-    CHECK(matches.calls == 2);
+              searcher, pattern, pattern_len, test_forward_match_cb, &matches) ==
+          (truncate_before_eof ? MINLZ_CORRUPT : MINLZ_OK));
+    CHECK(matches.calls == (truncate_before_eof ? 1 : 2));
     minlz_sidecar_searcher_destroy(searcher);
     free(sidecar.data);
     return 0;
@@ -2299,6 +2382,154 @@ static int test_search_forward_api(void) {
     return 0;
 }
 
+typedef struct test_forward_sequence {
+    const uint8_t *data;
+    size_t block_size;
+    size_t hits[4];
+} test_forward_sequence;
+
+static minlz_status test_forward_sequence_cb(
+    void *ctx, const minlz_search_result *result) {
+    test_forward_sequence *state = (test_forward_sequence *)ctx;
+    const size_t block = state->block_size;
+    const int64_t offsets[] = {80, 220, (int64_t)block - 4, (int64_t)block + 80};
+    size_t i;
+    for (i = 0u; i < 4u && offsets[i] != result->stream_offset; ++i) {}
+    CHECK(i < 4u);
+    CHECK(result->offset == result->stream_offset - result->block_start);
+    if (state->hits[i]++ != 0u) {
+        size_t start = i == 3u ? block : 0u;
+        size_t next = (state->hits[i] - 1u + (i >= 2u)) * block;
+        CHECK(next <= 3u * block);
+        CHECK(result->block_start == (int64_t)start);
+        CHECK(result->previous_block_len == next - start);
+        CHECK(result->previous_block != NULL &&
+              memcmp(result->previous_block, state->data + start, next - start) == 0);
+        if (next == 3u * block) {
+            CHECK(result->block == NULL && result->block_len == 0u);
+        } else {
+            CHECK(result->block_len == block && result->block != NULL &&
+                  memcmp(result->block, state->data + next, block) == 0);
+        }
+    }
+    /* In particular, asking again at EOF must not enqueue a new result. */
+    return MINLZ_SEARCH_FORWARD;
+}
+
+static int test_multiple_forward_matches(void) {
+    static const uint8_t pattern[] = "context-forward-match";
+    const size_t block = MINLZ_MIN_BLOCK_SIZE;
+    uint8_t src[3u * MINLZ_MIN_BLOCK_SIZE];
+    minlz_stream_options opts;
+    minlz_search_config cfg;
+    test_mem_write wire = {0}, sidecar = {0}, stripped = {0};
+    test_mem_read read = {0}, meta = {0};
+    minlz_block_searcher *inline_search = NULL;
+    minlz_sidecar_searcher *side_search = NULL;
+    test_forward_sequence state = {src, block, {0}};
+
+    memset(src, 'a', block);
+    memset(src + block, 'b', block);
+    memset(src + 2u * block, 'c', block);
+    memcpy(src + 80u, pattern, sizeof(pattern) - 1u);
+    memcpy(src + 220u, pattern, sizeof(pattern) - 1u);
+    memcpy(src + block - 4u, pattern, sizeof(pattern) - 1u);
+    memcpy(src + block + 80u, pattern, sizeof(pattern) - 1u);
+    minlz_search_config_init(&cfg);
+    minlz_stream_options_init(&opts);
+    opts.block_size = block;
+    opts.add_index = 0;
+    opts.search = &cfg;
+    read.data = src;
+    read.len = sizeof(src);
+    CHECK(minlz_stream_encode(test_read_cb, &read, test_write_cb, &wire, &opts) == MINLZ_OK);
+
+    read = (test_mem_read){0};
+    read.data = wire.data;
+    read.len = wire.len;
+    CHECK(minlz_block_searcher_create(&inline_search, test_read_cb, &read) == MINLZ_OK);
+    CHECK(minlz_block_searcher_search(inline_search, pattern, sizeof(pattern) - 1u,
+              test_forward_sequence_cb, &state) == MINLZ_OK);
+    CHECK(state.hits[0] == 4u && state.hits[1] == 4u &&
+          state.hits[2] == 3u && state.hits[3] == 3u);
+    minlz_block_searcher_destroy(inline_search);
+
+    read.pos = 0u;
+    CHECK(minlz_extract_sidecar(test_write_cb, &sidecar, test_write_cb, &stripped,
+                                test_read_cb, &read) == MINLZ_OK);
+    read.data = stripped.data;
+    read.len = stripped.len;
+    meta.data = sidecar.data;
+    meta.len = sidecar.len;
+    memset(state.hits, 0, sizeof(state.hits));
+    CHECK(minlz_sidecar_searcher_create(&side_search, test_read_at_cb, &read,
+                                       test_read_cb, &meta) == MINLZ_OK);
+    CHECK(minlz_sidecar_searcher_search(side_search, pattern, sizeof(pattern) - 1u,
+              test_forward_sequence_cb, &state) == MINLZ_OK);
+    CHECK(state.hits[0] == 4u && state.hits[1] == 4u &&
+          state.hits[2] == 3u && state.hits[3] == 3u);
+    minlz_sidecar_searcher_destroy(side_search);
+    free(stripped.data);
+    free(sidecar.data);
+    free(wire.data);
+    return 0;
+}
+
+static int test_encode_buffer_search_boundaries(void) {
+    static const uint8_t pattern[] = " boundary-marker";
+    const size_t block = MINLZ_MIN_BLOCK_SIZE;
+    uint8_t src[2u * MINLZ_MIN_BLOCK_SIZE];
+    minlz_stream_options opts;
+    minlz_search_config cfg;
+    unsigned mode;
+
+    memset(src, 'a', block);
+    memset(src + block, 'b', block);
+    memcpy(src + block - 1u, pattern, sizeof(pattern) - 1u);
+    minlz_search_config_init(&cfg);
+    CHECK(minlz_search_config_set_match_len(&cfg, 6u) == MINLZ_OK);
+    CHECK(minlz_search_config_set_byte_prefix(&cfg, pattern, 1u) == MINLZ_OK);
+    minlz_stream_options_init(&opts);
+    opts.block_size = block;
+    opts.add_index = 0;
+    opts.search = &cfg;
+    for (mode = 0u; mode < 3u; ++mode) {
+        minlz_writer *writer = NULL;
+        minlz_block_searcher *searcher = NULL;
+        test_mem_write wire = {0}, decoded = {0};
+        test_mem_read read = {0};
+        test_search_offsets matches = {{0}, 0u};
+        size_t written = 0u;
+
+        CHECK(minlz_writer_create(&writer, test_write_cb, &wire, &opts) == MINLZ_OK);
+        CHECK(minlz_writer_encode_buffer(writer, src, block) == MINLZ_OK);
+        if (mode == 2u) {
+            CHECK(minlz_writer_flush(writer) == MINLZ_OK);
+        }
+        if (mode == 1u) {
+            CHECK(minlz_writer_write(writer, src + block, block, &written) == MINLZ_OK &&
+                  written == block);
+        } else {
+            CHECK(minlz_writer_encode_buffer(writer, src + block, block) == MINLZ_OK);
+        }
+        CHECK(minlz_writer_close(writer) == MINLZ_OK);
+        minlz_writer_destroy(writer);
+        read.data = wire.data;
+        read.len = wire.len;
+        CHECK(minlz_stream_decode(test_read_cb, &read, test_write_cb, &decoded, &opts) == MINLZ_OK);
+        CHECK(decoded.len == sizeof(src) && memcmp(decoded.data, src, sizeof(src)) == 0);
+        read.pos = 0u;
+        CHECK(minlz_block_searcher_create(&searcher, test_read_cb, &read) == MINLZ_OK);
+        CHECK(minlz_block_searcher_search(searcher, pattern, sizeof(pattern) - 1u,
+                  test_search_offset_cb, &matches) == MINLZ_OK);
+        CHECK(matches.count == 1u && matches.values[0] == (int64_t)block - 1);
+        minlz_block_searcher_destroy(searcher);
+        free(decoded.data);
+        free(wire.data);
+    }
+    return 0;
+}
+
 static int test_search_lazy_previous_api(void) {
     static const uint8_t pattern[] =
         ":LAZY_PREVIOUS_CONTEXT";
@@ -2404,9 +2635,172 @@ static int test_search_lazy_previous_api(void) {
     return 0;
 }
 
+
+/* L1 output must not depend on a larger or previously used scratch table. */
+static int test_fastest_workspace_history(void) {
+    static const size_t sizes[] = {
+        0u, 1u, 16u, 17u, 32u, 33u, 64u, 127u, 128u, 129u, 255u, 256u, 257u, 512u,
+        1023u, 1024u, 1025u, 4095u, 4096u, 4097u, 16384u, 16385u, 65536u, 65537u
+    };
+    const size_t max_size = 65537u;
+    const size_t capacity = minlz_max_encoded_len(max_size);
+    minlz_workspace *ws = NULL;
+    uint8_t *src = (uint8_t *)malloc(max_size);
+    uint8_t *fresh = (uint8_t *)malloc(capacity);
+    uint8_t *reused = (uint8_t *)malloc(capacity);
+    uint8_t *decoded = (uint8_t *)malloc(max_size);
+    uint8_t *scratch = NULL;
+    size_t pass, index, i;
+    CHECK(src && fresh && reused && decoded);
+    CHECK(minlz_workspace_create(&ws) == MINLZ_OK);
+    for (pass = 0; pass < 4u; ++pass) {
+        if (pass == 2u) {
+            CHECK(minlz_workspace_prepare_encode_scratch(ws, 2u, 589824u, &scratch) == MINLZ_OK);
+            memset(scratch, 0xa5, 589824u);
+        }
+        for (index = 0; index < sizeof(sizes) / sizeof(sizes[0]); ++index) {
+            const size_t selected = (pass & 1u) ?
+                sizeof(sizes) / sizeof(sizes[0]) - 1u - index : index;
+            const size_t size = sizes[selected];
+            uint32_t state = (uint32_t)(1u + 7919u * pass + 173u * index);
+            size_t fresh_len = 0, reused_len = 0, decoded_len = 0;
+            for (i = 0; i < size; ++i) {
+                state = state * 1664525u + 1013904223u;
+                src[i] = pass < 2u ? (uint8_t)(state >> 24) :
+                    (uint8_t)("rpc-workspace-history:"[(i + index) % 22u] + (i / 97u) % 3u);
+            }
+            CHECK(minlz_encode(fresh, capacity, &fresh_len, src, size, MINLZ_LEVEL_FASTEST) == MINLZ_OK);
+            CHECK(minlz_encode_ws(ws, reused, capacity, &reused_len, src, size, MINLZ_LEVEL_FASTEST) == MINLZ_OK);
+            CHECK(fresh_len == reused_len && memcmp(fresh, reused, fresh_len) == 0);
+            CHECK(minlz_decode(decoded, max_size, &decoded_len, reused, reused_len) == MINLZ_OK);
+            CHECK(decoded_len == size && memcmp(decoded, src, size) == 0);
+            if (size <= 4096u) {
+                memset(reused, 0xa5, fresh_len + 1u);
+                CHECK(minlz_encode_ws(ws, reused, fresh_len - 1u, &reused_len,
+                                      src, size, MINLZ_LEVEL_FASTEST) == MINLZ_DST_TOO_SMALL);
+                CHECK(reused_len == fresh_len && reused[0] == 0xa5);
+                CHECK(reused[fresh_len - 1u] == 0xa5);
+                CHECK(minlz_encode_ws(ws, reused, fresh_len, &reused_len,
+                                      src, size, MINLZ_LEVEL_FASTEST) == MINLZ_OK);
+                CHECK(reused_len == fresh_len && memcmp(fresh, reused, fresh_len) == 0);
+                CHECK(reused[fresh_len] == 0xa5);
+            }
+        }
+        if (pass == 1u) minlz_workspace_reset(ws);
+    }
+    minlz_workspace_destroy(ws);
+    free(decoded);
+    free(reused);
+    free(fresh);
+    free(src);
+    return 0;
+}
+
+static int test_raw_mid_plain_copy(void) {
+    static const size_t sizes[] = {8192u, 8193u, 10000u, 16383u, 16384u};
+    static const int shifts[] = {-17, -1, 0, 3, 17, 63};
+    uint8_t *storage = (uint8_t *)malloc(16384u + 256u);
+    uint8_t *expected = (uint8_t *)malloc(16384u);
+    size_t i, j, k;
+    CHECK(storage && expected);
+    for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        const size_t size = sizes[i];
+        for (k = 0; k < size; ++k) expected[k] = (uint8_t)(k * 173u + k / 31u);
+        for (j = 0; j < sizeof(shifts) / sizeof(shifts[0]); ++j) {
+            uint8_t *encoded = storage + 64u;
+            uint8_t *decoded = encoded + shifts[j];
+            size_t decoded_len = 0;
+            memset(storage, 0xa5, 16384u + 256u);
+            encoded[0] = encoded[1] = 0;
+            memcpy(encoded + 2u, expected, size);
+            CHECK(minlz_decode_ws(NULL, decoded, size, &decoded_len,
+                                  encoded, size + 2u) == MINLZ_OK);
+            CHECK(decoded_len == size && memcmp(decoded, expected, size) == 0);
+        }
+        {
+            uint8_t *encoded = storage + 64u;
+            size_t decoded_len = 0;
+            encoded[0] = encoded[1] = 0;
+            memcpy(encoded + 2u, expected, size);
+            CHECK(minlz_decode_ws(NULL, expected, size - 1u, &decoded_len,
+                                  encoded, size + 2u) == MINLZ_DST_TOO_SMALL);
+            CHECK(decoded_len == size);
+            CHECK(minlz_decode_ws(NULL, NULL, size, &decoded_len,
+                                  encoded, size + 2u) == MINLZ_CORRUPT);
+        }
+    }
+    free(expected);
+    free(storage);
+    return 0;
+}
+
+static int test_fastest_guarded_bucket_boundaries(void) {
+#if defined(__linux__)
+    static const size_t sizes[] = {
+        4095u, 4096u, 4097u, 8191u, 8192u, 8193u,
+        16383u, 16384u, 16385u, 32767u, 32768u,
+        65535u, 65536u, 65537u, 262143u, 262144u, 262145u,
+        524287u, 524288u, 524289u, 1048575u, 1048576u, 1048577u,
+        2097151u, 2097152u
+    };
+    const long native_page = sysconf(_SC_PAGESIZE);
+    size_t page;
+    CHECK(native_page > 0);
+    page = (size_t)native_page;
+    const size_t maximum = sizes[sizeof(sizes) / sizeof(sizes[0]) - 1u];
+    const size_t usable = ((maximum + page - 1u) / page) * page;
+    const size_t out_cap = minlz_max_encoded_len(maximum);
+    int fd = open("/dev/zero", O_RDWR);
+    uint8_t *memory;
+    uint8_t *encoded = (uint8_t *)malloc(out_cap + 32u);
+    uint8_t *decoded = (uint8_t *)malloc(maximum);
+    minlz_workspace *ws = NULL;
+    size_t i, j, shape;
+    CHECK(fd >= 0 && encoded && decoded);
+    memory = (uint8_t *)mmap(NULL, usable + page, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE, fd, 0);
+    CHECK(close(fd) == 0);
+    CHECK(memory != MAP_FAILED);
+    CHECK(mprotect(memory + usable, page, PROT_NONE) == 0);
+    CHECK(minlz_workspace_create(&ws) == MINLZ_OK);
+    for (shape = 0; shape < 6u; ++shape) {
+        for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+            const size_t size = sizes[i];
+            const size_t cap = minlz_max_encoded_len(size);
+            uint8_t *src = memory + usable - size;
+            uint64_t rng = UINT64_C(0xd6e8feb86659fd93) ^ size ^ shape;
+            size_t length = 0, got = 0;
+            for (j = 0; j < size; ++j) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                src[j] = (uint8_t)(rng >> 24);
+                if (shape == 1u) src[j] = (uint8_t)(j % 7u);
+                if (shape >= 2u && j >= 256u && j % 10u < shape * 2u) {
+                    src[j] = src[j - 256u];
+                }
+            }
+            memset(encoded, 0xa5, out_cap + 32u);
+            CHECK(minlz_encode_ws(ws, encoded, cap, &length, src, size,
+                                  MINLZ_LEVEL_FASTEST) == MINLZ_OK);
+            CHECK(length <= cap);
+            for (j = cap; j < out_cap + 32u; ++j) CHECK(encoded[j] == 0xa5);
+            CHECK(minlz_decode(decoded, size, &got, encoded, length) == MINLZ_OK);
+            CHECK(got == size && memcmp(decoded, src, size) == 0);
+        }
+    }
+    minlz_workspace_destroy(ws);
+    CHECK(munmap(memory, usable + page) == 0);
+    free(decoded);
+    free(encoded);
+#endif
+    return 0;
+}
+
 int main(void) {
     CHECK(test_backend_probe() == 0);
     CHECK(test_workspace_scratch_reuse() == 0);
+    CHECK(test_fastest_workspace_history() == 0);
+    CHECK(test_raw_mid_plain_copy() == 0);
+    CHECK(test_fastest_guarded_bucket_boundaries() == 0);
     CHECK(test_varint_crc() == 0);
     CHECK(test_roundtrips() == 0);
     CHECK(test_balanced_16k_hash_loop() == 0);
@@ -2424,6 +2818,7 @@ int main(void) {
     CHECK(test_fastest_2mb_structured() == 0);
     CHECK(test_corrupt() == 0);
     CHECK(test_index_api() == 0);
+    CHECK(test_stream_segment_index() == 0);
     CHECK(test_reader_writer_api() == 0);
     CHECK(test_readseeker_large_cache() == 0);
     CHECK(test_readseeker_mixed_cache() == 0);
@@ -2432,6 +2827,8 @@ int main(void) {
     CHECK(test_search_three_block_straddle() == 0);
     CHECK(test_search_prefix_only_tail() == 0);
     CHECK(test_search_forward_api() == 0);
+    CHECK(test_multiple_forward_matches() == 0);
+    CHECK(test_encode_buffer_search_boundaries() == 0);
     CHECK(test_search_lazy_previous_api() == 0);
     return 0;
 }

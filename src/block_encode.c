@@ -7,6 +7,10 @@
 
 #include <stdlib.h>
 
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+#include <immintrin.h>
+#endif
+
 #ifndef MINLZ_ENABLE_BALANCED_512K_BODY
 #define MINLZ_ENABLE_BALANCED_512K_BODY 0
 #endif
@@ -157,7 +161,7 @@
 #endif
 
 #define MINLZ_ENABLE_L1_2MB_INLINE_ACTIVE \
-    (MINLZ_ENABLE_L1_2MB_GOASM && MINLZ_ENABLE_L1_BLOCK2MB_INLINE_ASM)
+    (MINLZ_HAVE_INLINE_ASM_AMD64 && MINLZ_ENABLE_L1_2MB_GOASM && MINLZ_ENABLE_L1_BLOCK2MB_INLINE_ASM)
 
 #ifndef MINLZ_L1_2MB_REG_NEXT_EMIT
 #define MINLZ_L1_2MB_REG_NEXT_EMIT 1
@@ -285,10 +289,6 @@
 
 #ifndef MINLZ_PERIODIC_EQUAL_MEMCMP_MIN
 #define MINLZ_PERIODIC_EQUAL_MEMCMP_MIN (1u << 20)
-#endif
-
-#ifndef MINLZ_PERIODIC_EQUAL_LIBC_SSE42
-#define MINLZ_PERIODIC_EQUAL_LIBC_SSE42 0
 #endif
 
 #ifndef MINLZ_PERIODIC_EQUAL_AVX2_512
@@ -440,37 +440,29 @@ static MINLZ_ALWAYS_INLINE void minlz_fastest64k_probe_inline_asm_amd64(
     uint16_t *table, uint64_t cv, unsigned hash_shift, uint16_t pos,
     int *candidate0, int *candidate1, uint32_t *hash2_out) {
 #if MINLZ_HAVE_INLINE_ASM_AMD64
-    uint64_t c0;
-    uint64_t c1;
-    uint64_t h2;
-    const uint64_t prime5 = 889523592379ull;
+    uint64_t h0 = cv;
+    uint64_t h1 = cv >> 8;
+    uint64_t h2 = cv >> 16;
+    uint32_t c0;
+    uint32_t c1;
+    const uint64_t prime5 = 889523592379ull << 24;
     const uint16_t pos1 = (uint16_t)(pos + 1u);
-
     __asm__ volatile(
-        "movq %[cv], %%r10\n\t"
-        "movq %[cv], %%r11\n\t"
-        "movq %[cv], %%r8\n\t"
-        "shlq $24, %%r10\n\t"
-        "imulq %[prime5], %%r10\n\t"
-        "shrq %b[shift], %%r10\n\t"
-        "movzwl (%[table],%%r10,2), %k[c0]\n\t"
-        "movw %w[pos], (%[table],%%r10,2)\n\t"
-        "shrq $8, %%r11\n\t"
-        "shlq $24, %%r11\n\t"
-        "imulq %[prime5], %%r11\n\t"
-        "shrq %b[shift], %%r11\n\t"
-        "movzwl (%[table],%%r11,2), %k[c1]\n\t"
-        "movw %w[pos1], (%[table],%%r11,2)\n\t"
-        "shrq $16, %%r8\n\t"
-        "shlq $24, %%r8\n\t"
-        "imulq %[prime5], %%r8\n\t"
-        "shrq %b[shift], %%r8\n\t"
-        "movq %%r8, %[h2]"
-        : [c0] "=&r"(c0), [c1] "=&r"(c1), [h2] "=&r"(h2)
-        : [table] "r"(table), [cv] "r"(cv), [prime5] "r"(prime5),
-          [shift] "c"(hash_shift), [pos] "r"(pos), [pos1] "r"(pos1)
-        : "r8", "r10", "r11", "cc", "memory");
-
+        "imulq %[prime5], %[h0]\n\t"
+        "imulq %[prime5], %[h1]\n\t"
+        "imulq %[prime5], %[h2]\n\t"
+        "shrq %b[shift], %[h0]\n\t"
+        "shrq %b[shift], %[h1]\n\t"
+        "shrq %b[shift], %[h2]\n\t"
+        "movzwl (%[table],%[h0],2), %k[c0]\n\t"
+        "movzwl (%[table],%[h1],2), %k[c1]\n\t"
+        "movw %w[pos], (%[table],%[h0],2)\n\t"
+        "movw %w[pos1], (%[table],%[h1],2)"
+        : [h0] "+&r"(h0), [h1] "+&r"(h1), [h2] "+&r"(h2),
+          [c0] "=&r"(c0), [c1] "=&r"(c1)
+        : [table] "r"(table), [prime5] "r"(prime5), [shift] "Jc"(hash_shift),
+          [pos] "r"(pos), [pos1] "r"(pos1)
+        : "cc", "memory");
     *candidate0 = (int)c0;
     *candidate1 = (int)c1;
     *hash2_out = (uint32_t)h2;
@@ -550,33 +542,221 @@ static inline size_t minlz_match_len_inline_asm_amd64(const uint8_t *a, const ui
 #endif
 }
 
-static inline size_t minlz_match_len_fastest(const uint8_t *a, const uint8_t *b, size_t max_len) {
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+static MINLZ_ALWAYS_INLINE __m128i minlz_equal_aligned_sse2(const uint8_t *a,
+                                                            const uint8_t *b) {
+    return _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(const void *)a),
+                         _mm_load_si128((const __m128i *)(const void *)b));
+}
+
+/* These loops return the matched prefix of complete vectors. The caller
+ * handles the short tail with the same bounds as the scalar path. */
+static MINLZ_NOINLINE size_t minlz_match_vectors_sse2(const uint8_t *a, const uint8_t *b, size_t len) {
     size_t n = 0;
+    /* Reduce complete groups to one mismatch test. The short loop
+     * below finds the first different byte in a group that fails. */
+    if (len >= (128u << 10)) {
+        /* An aligned second operand can be folded into PCMPEQB. */
+        const size_t head = (16u - ((uintptr_t)b & 15u)) & 15u;
+        if (head != 0u) {
+            const __m128i x = _mm_loadu_si128((const __m128i *)(const void *)a);
+            const __m128i y = _mm_loadu_si128((const __m128i *)(const void *)b);
+            const unsigned diff = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) ^ 0xffffu;
+            if (diff != 0) {
+                return minlz_ctz64(diff);
+            }
+            n = head;
+        }
+        while (len - n >= 128u) {
+            const __m128i eq0 = minlz_equal_aligned_sse2(a + n, b + n);
+            const __m128i eq1 = minlz_equal_aligned_sse2(a + n + 16u, b + n + 16u);
+            const __m128i eq2 = minlz_equal_aligned_sse2(a + n + 32u, b + n + 32u);
+            const __m128i eq3 = minlz_equal_aligned_sse2(a + n + 48u, b + n + 48u);
+            const __m128i eq4 = minlz_equal_aligned_sse2(a + n + 64u, b + n + 64u);
+            const __m128i eq5 = minlz_equal_aligned_sse2(a + n + 80u, b + n + 80u);
+            const __m128i eq6 = minlz_equal_aligned_sse2(a + n + 96u, b + n + 96u);
+            const __m128i eq7 = minlz_equal_aligned_sse2(a + n + 112u, b + n + 112u);
+            const __m128i eq01 = _mm_and_si128(eq0, eq1);
+            const __m128i eq23 = _mm_and_si128(eq2, eq3);
+            const __m128i eq45 = _mm_and_si128(eq4, eq5);
+            const __m128i eq67 = _mm_and_si128(eq6, eq7);
+            const __m128i eq0123 = _mm_and_si128(eq01, eq23);
+            const __m128i eq4567 = _mm_and_si128(eq45, eq67);
+            if (_mm_movemask_epi8(_mm_and_si128(eq0123, eq4567)) != 0xffff) {
+                break;
+            }
+            n += 128u;
+        }
+    }
+    while (len - n >= 32u) {
+        const __m128i x0 = _mm_loadu_si128((const __m128i *)(const void *)(a + n));
+        const __m128i y0 = _mm_loadu_si128((const __m128i *)(const void *)(b + n));
+        const __m128i x1 = _mm_loadu_si128((const __m128i *)(const void *)(a + n + 16u));
+        const __m128i y1 = _mm_loadu_si128((const __m128i *)(const void *)(b + n + 16u));
+        const __m128i eq0 = _mm_cmpeq_epi8(x0, y0);
+        const __m128i eq1 = _mm_cmpeq_epi8(x1, y1);
+        if (_mm_movemask_epi8(_mm_and_si128(eq0, eq1)) != 0xffff) {
+            const unsigned first = (unsigned)_mm_movemask_epi8(eq0) ^ 0xffffu;
+            if (first != 0) {
+                return n + minlz_ctz64(first);
+            }
+            return n + 16u + minlz_ctz64((unsigned)_mm_movemask_epi8(eq1) ^ 0xffffu);
+        }
+        n += 32u;
+    }
+    if (len - n >= 16u) {
+        const __m128i x = _mm_loadu_si128((const __m128i *)(const void *)(a + n));
+        const __m128i y = _mm_loadu_si128((const __m128i *)(const void *)(b + n));
+        const unsigned diff = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) ^ 0xffffu;
+        if (diff != 0) {
+            return n + minlz_ctz64(diff);
+        }
+        n += 16u;
+    }
+    return n;
+}
+
+#if defined(MINLZ_HAVE_AVX2) && MINLZ_HAVE_AVX2
+static MINLZ_NOINLINE __attribute__((target("avx2"))) size_t
+minlz_match_vectors_avx2(const uint8_t *a, const uint8_t *b, size_t len) {
+    size_t n = 0;
+    while (len - n >= 64u) {
+        const __m256i x0 = _mm256_loadu_si256((const __m256i *)(const void *)(a + n));
+        const __m256i y0 = _mm256_loadu_si256((const __m256i *)(const void *)(b + n));
+        const __m256i x1 = _mm256_loadu_si256((const __m256i *)(const void *)(a + n + 32u));
+        const __m256i y1 = _mm256_loadu_si256((const __m256i *)(const void *)(b + n + 32u));
+        const __m256i eq0 = _mm256_cmpeq_epi8(x0, y0);
+        const __m256i eq1 = _mm256_cmpeq_epi8(x1, y1);
+        if (_mm256_movemask_epi8(_mm256_and_si256(eq0, eq1)) != -1) {
+            const uint32_t first = ~(uint32_t)_mm256_movemask_epi8(eq0);
+            if (first != 0) {
+                return n + minlz_ctz64(first);
+            }
+            return n + 32u + minlz_ctz64(~(uint32_t)_mm256_movemask_epi8(eq1));
+        }
+        n += 64u;
+    }
+    if (len - n >= 32u) {
+        const __m256i x = _mm256_loadu_si256((const __m256i *)(const void *)(a + n));
+        const __m256i y = _mm256_loadu_si256((const __m256i *)(const void *)(b + n));
+        const uint32_t diff = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y));
+        if (diff != 0) {
+            return n + minlz_ctz64(diff);
+        }
+        n += 32u;
+    }
+    return n;
+}
+#endif
+
+#if defined(MINLZ_HAVE_AVX512) && MINLZ_HAVE_AVX512
+static MINLZ_NOINLINE __attribute__((target("avx512f,avx512bw"))) size_t
+minlz_match_vectors_avx512(const uint8_t *a, const uint8_t *b, size_t len) {
+    size_t n = 0;
+    while (len - n >= 128u) {
+        const __m512i x0 = _mm512_loadu_si512((const void *)(a + n));
+        const __m512i y0 = _mm512_loadu_si512((const void *)(b + n));
+        const __m512i x1 = _mm512_loadu_si512((const void *)(a + n + 64u));
+        const __m512i y1 = _mm512_loadu_si512((const void *)(b + n + 64u));
+        const __m512i xor0 = _mm512_xor_si512(x0, y0);
+        /* OR of the two independent XOR differences. */
+        const __m512i any = _mm512_ternarylogic_epi64(xor0, x1, y1, 0xf6);
+        if (_mm512_test_epi64_mask(any, any) != 0) {
+            const uint64_t first = _mm512_cmpneq_epi8_mask(x0, y0);
+            if (first != 0) {
+                return n + minlz_ctz64(first);
+            }
+            return n + 64u + minlz_ctz64(_mm512_cmpneq_epi8_mask(x1, y1));
+        }
+        n += 128u;
+    }
+    if (len - n >= 64u) {
+        const __m512i x = _mm512_loadu_si512((const void *)(a + n));
+        const __m512i y = _mm512_loadu_si512((const void *)(b + n));
+        const uint64_t diff = _mm512_cmpneq_epi8_mask(x, y);
+        if (diff != 0) {
+            return n + minlz_ctz64(diff);
+        }
+        n += 64u;
+    }
+    return n;
+}
+#endif
+
+static MINLZ_NOINLINE size_t minlz_match_vectors(const uint8_t *a, const uint8_t *b, size_t len) {
+#if defined(MINLZ_HAVE_AVX512) && MINLZ_HAVE_AVX512
+    if (minlz_backend_has_avx512()) {
+        return minlz_match_vectors_avx512(a, b, len);
+    }
+#endif
+#if defined(MINLZ_HAVE_AVX2) && MINLZ_HAVE_AVX2
+    if (minlz_backend_has_avx2()) {
+        return minlz_match_vectors_avx2(a, b, len);
+    }
+#endif
+    return minlz_match_vectors_sse2(a, b, len);
+}
+#endif
+
+typedef enum {
+    MINLZ_L1_MATCH_SCALAR,
+    MINLZ_L1_MATCH_LONG,
+    MINLZ_L1_MATCH_LONG_SSE2,
+    MINLZ_L1_MATCH_PREFIX_SSE2
+} minlz_l1_match_mode;
+
+static MINLZ_ALWAYS_INLINE size_t minlz_match_len_fastest(const uint8_t *a, const uint8_t *b,
+                                                         size_t max_len, minlz_l1_match_mode mode) {
+    size_t n = 0;
+    (void)mode;
     if (max_len >= 32) {
-        uint64_t diff = minlz_load64(a) ^ minlz_load64(b);
-        if (diff != 0) {
-            return (size_t)(minlz_ctz64(diff) >> 3);
-        }
-        diff = minlz_load64(a + 8) ^ minlz_load64(b + 8);
-        if (diff != 0) {
-            return 8u + (size_t)(minlz_ctz64(diff) >> 3);
-        }
-        diff = minlz_load64(a + 16) ^ minlz_load64(b + 16);
-        if (diff != 0) {
-            return 16u + (size_t)(minlz_ctz64(diff) >> 3);
-        }
-        diff = minlz_load64(a + 24) ^ minlz_load64(b + 24);
-        if (diff != 0) {
-            return 24u + (size_t)(minlz_ctz64(diff) >> 3);
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+        if (mode == MINLZ_L1_MATCH_PREFIX_SSE2) {
+            const __m128i a0 = _mm_loadu_si128((const __m128i *)(const void *)a);
+            const __m128i b0 = _mm_loadu_si128((const __m128i *)(const void *)b);
+            const __m128i a1 = _mm_loadu_si128((const __m128i *)(const void *)(a + 16u));
+            const __m128i b1 = _mm_loadu_si128((const __m128i *)(const void *)(b + 16u));
+            const uint32_t lo = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(a0, b0));
+            const uint32_t hi = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(a1, b1));
+            const uint32_t diff = ~(lo | (hi << 16));
+            if (diff != 0u) {
+                return minlz_ctz64(diff);
+            }
+        } else
+#endif
+        {
+            uint64_t diff = minlz_load64(a) ^ minlz_load64(b);
+            if (diff != 0) {
+                return (size_t)(minlz_ctz64(diff) >> 3);
+            }
+            diff = minlz_load64(a + 8) ^ minlz_load64(b + 8);
+            if (diff != 0) {
+                return 8u + (size_t)(minlz_ctz64(diff) >> 3);
+            }
+            diff = minlz_load64(a + 16) ^ minlz_load64(b + 16);
+            if (diff != 0) {
+                return 16u + (size_t)(minlz_ctz64(diff) >> 3);
+            }
+            diff = minlz_load64(a + 24) ^ minlz_load64(b + 24);
+            if (diff != 0) {
+                return 24u + (size_t)(minlz_ctz64(diff) >> 3);
+            }
         }
         n = 32;
-#if defined(MINLZ_HAVE_ASM_AMD64) && MINLZ_HAVE_ASM_AMD64
-        if (max_len >= 256) {
-            minlz_backend backend = minlz_select_backend();
-            if (backend == MINLZ_BACKEND_ASM_AMD64 || backend == MINLZ_BACKEND_AVX2 ||
-                backend == MINLZ_BACKEND_AVX512) {
-                return n + minlz_match_len_inline_asm_amd64(a + n, b + n, max_len - n);
-            }
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+        if (mode == MINLZ_L1_MATCH_LONG_SSE2 && max_len >= 128u &&
+            ((minlz_load64(a + 32u) ^ minlz_load64(b + 32u)) |
+             (minlz_load64(a + 40u) ^ minlz_load64(b + 40u)) |
+             (minlz_load64(a + 48u) ^ minlz_load64(b + 48u)) |
+             (minlz_load64(a + 56u) ^ minlz_load64(b + 56u))) == 0) {
+            n = 64u + minlz_match_vectors_sse2(a + 64u, b + 64u, max_len - 64u);
+        }
+        if (mode == MINLZ_L1_MATCH_LONG && max_len >= (4u << 10) &&
+            ((minlz_load64(a + 32u) ^ minlz_load64(b + 32u)) |
+             (minlz_load64(a + 40u) ^ minlz_load64(b + 40u)) |
+             (minlz_load64(a + 48u) ^ minlz_load64(b + 48u)) |
+             (minlz_load64(a + 56u) ^ minlz_load64(b + 56u))) == 0) {
+            n = 64u + minlz_match_vectors(a + 64u, b + 64u, max_len - 64u);
         }
 #endif
     }
@@ -859,14 +1039,18 @@ static inline void minlz_extend_match_int_better(const uint8_t *src, int *s,
     *candidate += (int)matched;
 }
 
-static inline void minlz_extend_match_int_fastest(const uint8_t *src, int *s,
-                                                  int *candidate, int src_len) {
-    size_t matched = minlz_match_len_fastest(src + *s, src + *candidate,
-                                             (size_t)(src_len - *s));
+static MINLZ_ALWAYS_INLINE void minlz_extend_match_int_fastest_impl(
+    const uint8_t *src, int *s, int *candidate, int src_len, minlz_l1_match_mode mode) {
+    const size_t matched = minlz_match_len_fastest(src + *s, src + *candidate,
+                                                  (size_t)(src_len - *s), mode);
     *s += (int)matched;
     *candidate += (int)matched;
 }
 
+static inline void minlz_extend_match_int_fastest(const uint8_t *src, int *s,
+                                                 int *candidate, int src_len) {
+    minlz_extend_match_int_fastest_impl(src, s, candidate, src_len, MINLZ_L1_MATCH_SCALAR);
+}
 static inline void minlz_extend_match_size(const uint8_t *src, size_t *s,
                                            size_t *candidate, size_t src_len) {
     size_t matched = minlz_match_len_fast(src + *s, src + *candidate, src_len - *s);
@@ -1070,16 +1254,66 @@ static int minlz_fastest_l1_2mb_prefers_goasm(const uint8_t *src, size_t src_len
 }
 #endif
 
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+/* Classify exactly the same stride-16 sample as the portable probe. */
+static void minlz_l1_sample_counts(const uint8_t *src, size_t n,
+                                 size_t *printable, size_t *controls, size_t *high) {
+    const __m128i zero = _mm_setzero_si128();
+    __m128i p = zero, c = zero, h = zero;
+    size_t i;
+    for (i = 0; i + 256u <= n; i += 256u) {
+        const uint8_t *s = src + i;
+        const __m128i v = _mm_setr_epi8(s[0], s[16], s[32], s[48], s[64], s[80],
+            s[96], s[112], s[128], s[144], s[160], s[176], s[192], s[208], s[224], s[240]);
+        const __m128i whitespace = _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(9)),
+            _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(10)), _mm_cmpeq_epi8(v, _mm_set1_epi8(13))));
+        const __m128i ascii = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(31)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(127), v));
+        const __m128i positive = _mm_cmpeq_epi8(_mm_and_si128(v, _mm_set1_epi8(-128)), zero);
+        const __m128i control = _mm_andnot_si128(whitespace,
+            _mm_and_si128(positive, _mm_cmpgt_epi8(_mm_set1_epi8(32), v)));
+        p = _mm_add_epi64(p, _mm_sad_epu8(_mm_or_si128(ascii, whitespace), zero));
+        c = _mm_add_epi64(c, _mm_sad_epu8(control, zero));
+        h = _mm_add_epi64(h, _mm_sad_epu8(_mm_cmpgt_epi8(zero, v), zero));
+    }
+    *printable = ((uint64_t)_mm_cvtsi128_si64(p) + (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(p,8))) / 255u;
+    *controls = ((uint64_t)_mm_cvtsi128_si64(c) + (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(c,8))) / 255u;
+    *high = ((uint64_t)_mm_cvtsi128_si64(h) + (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(h,8))) / 255u;
+    for (; i < n; i += 16u) {
+        const uint8_t v = src[i];
+        *printable += (v >= 32u && v <= 126u) || v == 9u || v == 10u || v == 13u;
+        *controls += v < 32u && v != 9u && v != 10u && v != 13u;
+        *high += v >= 128u;
+    }
+}
+#endif
+
 static int minlz_fastest_l1_cheap_binary_probe(const uint8_t *src, size_t src_len) {
     size_t n = src_len < 2048u ? src_len : 2048u;
     size_t samples = 0;
     size_t printable = 0;
     size_t controls = 0;
     size_t high = 0;
+#if !(MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32))
     size_t i;
+#endif
     if (src_len < (256u << 10) || n < 1024u) {
         return 0;
     }
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+    samples = (n + 15u) / 16u;
+    minlz_l1_sample_counts(src, n / 2u, &printable, &controls, &high);
+    if (controls * 100u > samples * 10u || high * 100u > samples * 24u) {
+        return 1;
+    }
+    {
+        size_t p, c, h;
+        minlz_l1_sample_counts(src + n / 2u, n / 2u, &p, &c, &h);
+        printable += p;
+        controls += c;
+        high += h;
+    }
+#else
     for (i = 0; i < n; i += 16u) {
         uint8_t c = src[i];
         samples++;
@@ -1087,6 +1321,7 @@ static int minlz_fastest_l1_cheap_binary_probe(const uint8_t *src, size_t src_le
         controls += (c < 32u && c != '\n' && c != '\r' && c != '\t');
         printable += ((c >= 32u && c <= 126u) || c == '\n' || c == '\r' || c == '\t');
     }
+#endif
     return printable * 100u < samples * 58u ||
            controls * 100u > samples * 10u ||
            high * 100u > samples * 24u;
@@ -1107,6 +1342,19 @@ static int minlz_fastest_l1_likely_incompressible(const uint8_t *src, size_t src
     if (n < 4096u) {
         return 0;
     }
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+    samples = (n + 15u) / 16u;
+    minlz_l1_sample_counts(src, n / 2u, &printable, &controls, &high);
+    /* These counts only increase. Once either limit is exceeded,
+     * the remaining sample cannot make the block look like text. */
+    if (controls * 100u <= samples * 8u && high * 100u < samples * 20u) {
+        size_t p, c, h;
+        minlz_l1_sample_counts(src + n / 2u, n / 2u, &p, &c, &h);
+        printable += p;
+        controls += c;
+        high += h;
+    }
+#else
     for (i = 0; i < n; i += 16u) {
         uint8_t c = src[i];
         samples++;
@@ -1114,6 +1362,7 @@ static int minlz_fastest_l1_likely_incompressible(const uint8_t *src, size_t src
         controls += (c < 32u && c != '\n' && c != '\r' && c != '\t');
         printable += ((c >= 32u && c <= 126u) || c == '\n' || c == '\r' || c == '\t');
     }
+#endif
     if (printable * 100u >= samples * 70u &&
         controls * 100u <= samples * 8u &&
         high * 100u < samples * 20u) {
@@ -1887,8 +2136,16 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_16k_inline_asm(uint8_t *dst
         "movq %[tmp], 48(%%rsp)\n"
         "movq 48(%%rsp), %%rdi\n"
         "xorl %%eax, %%eax\n"
-        "movl $0x00000400, %%ecx\n"
-        "rep stosq\n"
+        "movl $128, %%ecx\n"
+        "pxor %%xmm0, %%xmm0\n"
+        ".Lminlz_clear_16k_%=:\n"
+        "movdqu %%xmm0, (%%rdi)\n"
+        "movdqu %%xmm0, 16(%%rdi)\n"
+        "movdqu %%xmm0, 32(%%rdi)\n"
+        "movdqu %%xmm0, 48(%%rdi)\n"
+        "addq $64, %%rdi\n"
+        "decl %%ecx\n"
+        "jnz .Lminlz_clear_16k_%=\n"
         "movq 48(%%rsp), %%rax\n"
         "movq 24(%%rsp), %%rcx\n"
         "movl $0x00000000, 12(%%rsp)\n"
@@ -1912,14 +2169,12 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_16k_inline_asm(uint8_t *dst
         "jae .Lminlz_block16k_%=_emit_remainder_encodeBlockAsm16K\n"
         "movq (%%rbx,%%rdx,1), %%rdi\n"
         "movl %%esi, 20(%%rsp)\n"
-        "movq $0x000000cf1bbcdcbb, %%r9\n"
+        "movq $0xcf1bbcdcbb000000, %%r9\n"
         "movq %%rdi, %%r10\n"
-        "shlq $0x18, %%r10\n"
         "imulq %%r9, %%r10\n"
         "shrq $0x34, %%r10\n"
         "movq %%rdi, %%r11\n"
         "shrq $0x08, %%r11\n"
-        "shlq $0x18, %%r11\n"
         "imulq %%r9, %%r11\n"
         "shrq $0x34, %%r11\n"
         "movzwl (%%rax,%%r10,2), %%esi\n"
@@ -1929,7 +2184,6 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_16k_inline_asm(uint8_t *dst
         "movw %%r10w, (%%rax,%%r11,2)\n"
         "movq %%rdi, %%r10\n"
         "shrq $0x10, %%r10\n"
-        "shlq $0x18, %%r10\n"
         "imulq %%r9, %%r10\n"
         "shrq $0x34, %%r10\n"
         "movl %%edx, %%r9d\n"
@@ -2583,14 +2837,12 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_16k_inline_asm(uint8_t *dst
         "xorq %%rax, %%rax\n"
         "jmp .Lminlz_block16k_%=_epilogue\n"
         ".Lminlz_block16k_%=_match_nolit_dst_ok_encodeBlockAsm16K:\n"
-        "movq $0x000000cf1bbcdcbb, %%rsi\n"
+        "movq $0xcf1bbcdcbb000000, %%rsi\n"
         "movq %%rdi, %%r8\n"
         "shrq $0x10, %%rdi\n"
         "movq %%rdi, %%r9\n"
-        "shlq $0x18, %%r8\n"
         "imulq %%rsi, %%r8\n"
         "shrq $0x34, %%r8\n"
-        "shlq $0x18, %%r9\n"
         "imulq %%rsi, %%r9\n"
         "shrq $0x34, %%r9\n"
         "leal -2(%%rdx), %%r10d\n"
@@ -2875,8 +3127,16 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_64k_inline_asm(uint8_t *dst
         "movq %[tmp], 48(%%rsp)\n"
         "movq 48(%%rsp), %%rdi\n"
         "xorl %%eax, %%eax\n"
-        "movl $0x00000800, %%ecx\n"
-        "rep stosq\n"
+        "movl $256, %%ecx\n"
+        "pxor %%xmm0, %%xmm0\n"
+        ".Lminlz_clear_64k_%=:\n"
+        "movdqu %%xmm0, (%%rdi)\n"
+        "movdqu %%xmm0, 16(%%rdi)\n"
+        "movdqu %%xmm0, 32(%%rdi)\n"
+        "movdqu %%xmm0, 48(%%rdi)\n"
+        "addq $64, %%rdi\n"
+        "decl %%ecx\n"
+        "jnz .Lminlz_clear_64k_%=\n"
         "movq 48(%%rsp), %%rax\n"
         "movq 24(%%rsp), %%rcx\n"
         "movl $0x00000000, 12(%%rsp)\n"
@@ -2900,14 +3160,12 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_64k_inline_asm(uint8_t *dst
         "jae .Lminlz_block64k_%=_emit_remainder_encodeBlockAsm64K\n"
         "movq (%%rbx,%%rdx,1), %%rdi\n"
         "movl %%esi, 20(%%rsp)\n"
-        "movq $0x0000cf1bbcdcbf9b, %%r9\n"
+        "movq $0xcf1bbcdcbf9b0000, %%r9\n"
         "movq %%rdi, %%r10\n"
-        "shlq $0x10, %%r10\n"
         "imulq %%r9, %%r10\n"
         "shrq $0x33, %%r10\n"
         "movq %%rdi, %%r11\n"
         "shrq $0x08, %%r11\n"
-        "shlq $0x10, %%r11\n"
         "imulq %%r9, %%r11\n"
         "shrq $0x33, %%r11\n"
         "movzwl (%%rax,%%r10,2), %%esi\n"
@@ -2917,7 +3175,6 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_64k_inline_asm(uint8_t *dst
         "movw %%r10w, (%%rax,%%r11,2)\n"
         "movq %%rdi, %%r10\n"
         "shrq $0x10, %%r10\n"
-        "shlq $0x10, %%r10\n"
         "imulq %%r9, %%r10\n"
         "shrq $0x33, %%r10\n"
         "movl %%edx, %%r9d\n"
@@ -3587,14 +3844,12 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_64k_inline_asm(uint8_t *dst
         "xorq %%rax, %%rax\n"
         "jmp .Lminlz_block64k_%=_epilogue\n"
         ".Lminlz_block64k_%=_match_nolit_dst_ok_encodeBlockAsm64K:\n"
-        "movq $0x0000cf1bbcdcbf9b, %%rsi\n"
+        "movq $0xcf1bbcdcbf9b0000, %%rsi\n"
         "movq %%rdi, %%r8\n"
         "shrq $0x10, %%rdi\n"
         "movq %%rdi, %%r9\n"
-        "shlq $0x10, %%r8\n"
         "imulq %%rsi, %%r8\n"
         "shrq $0x33, %%r8\n"
-        "shlq $0x10, %%r9\n"
         "imulq %%rsi, %%r9\n"
         "shrq $0x33, %%r9\n"
         "leal -2(%%rdx), %%r10d\n"
@@ -3871,1189 +4126,52 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_64k_inline_asm(uint8_t *dst
 #endif
 }
 #if MINLZ_ENABLE_L1_BLOCK2MB_INLINE_ASM
+#if 1
+#define MINLZ_L1_ASM_NAME minlz_encode_block_2mb_inline_asm_sse2
+#if MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+#define MINLZ_L1_ASM_ATTR MINLZ_NOINLINE
+#else
+#define MINLZ_L1_ASM_ATTR MINLZ_ALWAYS_INLINE
+#endif
+#define MINLZ_L1_COMPARE_BYTES 16
+#include "block_encode_l1_2mb_amd64.inc"
+#undef MINLZ_L1_COMPARE_BYTES
+#undef MINLZ_L1_ASM_ATTR
+#undef MINLZ_L1_ASM_NAME
+#endif
+#if MINLZ_HAVE_AVX2 && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+#define MINLZ_L1_ASM_NAME minlz_encode_block_2mb_inline_asm_avx2
+#define MINLZ_L1_ASM_ATTR MINLZ_NOINLINE __attribute__((target("avx2")))
+#define MINLZ_L1_COMPARE_BYTES 32
+#include "block_encode_l1_2mb_amd64.inc"
+#undef MINLZ_L1_COMPARE_BYTES
+#undef MINLZ_L1_ASM_ATTR
+#undef MINLZ_L1_ASM_NAME
+#endif
+#if MINLZ_HAVE_AVX2 && MINLZ_HAVE_AVX512 && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+#define MINLZ_L1_ASM_NAME minlz_encode_block_2mb_inline_asm_avx512
+#define MINLZ_L1_ASM_ATTR MINLZ_NOINLINE __attribute__((target("avx512f,avx512bw,avx512vl")))
+#define MINLZ_L1_COMPARE_BYTES 64
+#include "block_encode_l1_2mb_amd64.inc"
+#undef MINLZ_L1_COMPARE_BYTES
+#undef MINLZ_L1_ASM_ATTR
+#undef MINLZ_L1_ASM_NAME
+#endif
 static MINLZ_ALWAYS_INLINE size_t minlz_encode_block_2mb_inline_asm(uint8_t *dst, const uint8_t *src,
                                                        size_t src_len, uint8_t *tmp) {
-#if MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
-    size_t ret;
-    __asm__ volatile(
-        "pushq %%rbx\n"
-        "pushq %%r12\n"
-        "pushq %%r13\n"
-        "pushq %%r14\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "pushq %%r15\n"
+#if MINLZ_HAVE_AVX2 && MINLZ_HAVE_AVX512 && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+    if (minlz_backend_has_avx512() && minlz_backend_has_avx2()) {
+        return minlz_encode_block_2mb_inline_asm_avx512(dst, src, src_len, tmp);
+    }
 #endif
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "pushq %%rbp\n"
+#if MINLZ_HAVE_AVX2 && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+    if (minlz_backend_has_avx2()) {
+        return minlz_encode_block_2mb_inline_asm_avx2(dst, src, src_len, tmp);
+    }
 #endif
-        "subq $64, %%rsp\n"
-        "movq %[dst], 24(%%rsp)\n"
-        "movq %[src], 32(%%rsp)\n"
-        "movq %[src_len], 40(%%rsp)\n"
-        "movq %[tmp], 48(%%rsp)\n"
-        "movq 48(%%rsp), %%rdi\n"
-        "xorl %%eax, %%eax\n"
-        "movl $0x00004000, %%ecx\n"
-        "rep stosq\n"
-        "movq 48(%%rsp), %%rax\n"
-        "movq 24(%%rsp), %%rcx\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "xorl %%r15d, %%r15d\n"
-#else
-        "movl $0x00000000, 12(%%rsp)\n"
-#endif
-        "movq 40(%%rsp), %%rdx\n"
-        "leaq -17(%%rdx), %%rbx\n"
-        "leaq -17(%%rdx), %%rsi\n"
-        "movl %%esi, 8(%%rsp)\n"
-        "shrq $0x05, %%rdx\n"
-        "subl %%edx, %%ebx\n"
-        "leaq (%%rcx,%%rbx,1), %%rbx\n"
-        "movq %%rbx, (%%rsp)\n"
-        "movl $0x00000001, %%edx\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "movl %%edx, %%ebp\n"
-#else
-        "movl %%edx, 16(%%rsp)\n"
-#endif
-        "movq 32(%%rsp), %%rbx\n"
-        ".Lminlz_l1_2mb_inline_%=_search_loop_encodeBlockAsm2MB:\n"
-        "movl %%edx, %%esi\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "subl %%r15d, %%esi\n"
-#else
-        "subl 12(%%rsp), %%esi\n"
-#endif
-        "shrl $0x06, %%esi\n"
-        "leal 4(%%rdx,%%rsi,1), %%esi\n"
-        "cmpl 8(%%rsp), %%esi\n"
-        "jae .Lminlz_l1_2mb_inline_%=_emit_remainder_encodeBlockAsm2MB\n"
-        "movq (%%rbx,%%rdx,1), %%rdi\n"
-        "movl %%esi, 20(%%rsp)\n"
-        "movq $0x0000cf1bbcdcbf9b, %%r9\n"
-        "movq %%rdi, %%r10\n"
-        "shlq $0x10, %%r10\n"
-        "imulq %%r9, %%r10\n"
-        "shrq $0x31, %%r10\n"
-        "movq %%rdi, %%r11\n"
-        "shrq $0x08, %%r11\n"
-        "shlq $0x10, %%r11\n"
-        "imulq %%r9, %%r11\n"
-        "shrq $0x31, %%r11\n"
-        "movl (%%rax,%%r10,4), %%esi\n"
-        "movl (%%rax,%%r11,4), %%r8d\n"
-        "movl %%edx, (%%rax,%%r10,4)\n"
-        "leal 1(%%rdx), %%r10d\n"
-        "movl %%r10d, (%%rax,%%r11,4)\n"
-        "movq %%rdi, %%r10\n"
-        "shrq $0x10, %%r10\n"
-        "shlq $0x10, %%r10\n"
-        "imulq %%r9, %%r10\n"
-        "shrq $0x31, %%r10\n"
-        "movl %%edx, %%r9d\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "subl %%ebp, %%r9d\n"
-#else
-        "subl 16(%%rsp), %%r9d\n"
-#endif
-        "movl 1(%%rbx,%%r9,1), %%r11d\n"
-        "movq %%rdi, %%r9\n"
-        "shrq $0x08, %%r9\n"
-        "cmpl %%r11d, %%r9d\n"
-        "jne .Lminlz_l1_2mb_inline_%=_no_repeat_found_encodeBlockAsm2MB\n"
-        "leal 1(%%rdx), %%edi\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "movl %%r15d, %%esi\n"
-#else
-        "movl 12(%%rsp), %%esi\n"
-#endif
-        "movl %%edi, %%r8d\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "subl %%ebp, %%r8d\n"
-#else
-        "subl 16(%%rsp), %%r8d\n"
-#endif
-        "jz .Lminlz_l1_2mb_inline_%=_repeat_extend_back_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_extend_back_loop_encodeBlockAsm2MB:\n"
-        "cmpl %%esi, %%edi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_repeat_extend_back_end_encodeBlockAsm2MB\n"
-        "movb -1(%%rbx,%%r8,1), %%r9b\n"
-        "movb -1(%%rbx,%%rdi,1), %%r10b\n"
-        "cmpb %%r10b, %%r9b\n"
-        "jne .Lminlz_l1_2mb_inline_%=_repeat_extend_back_end_encodeBlockAsm2MB\n"
-        "leal -1(%%rdi), %%edi\n"
-        "decl %%r8d\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_repeat_extend_back_loop_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_extend_back_end_encodeBlockAsm2MB:\n"
-        "movl %%edi, %%esi\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "movl %%r15d, %%r8d\n"
-#else
-        "movl 12(%%rsp), %%r8d\n"
-#endif
-        "subl %%r8d, %%esi\n"
-        "leaq 4(%%rcx,%%rsi,1), %%r9\n"
-        "cmpq (%%rsp), %%r9\n"
-        "jb .Lminlz_l1_2mb_inline_%=_dst_size_check_ok_1\n"
-        "xorq %%rax, %%rax\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        ".Lminlz_l1_2mb_inline_%=_dst_size_check_ok_1:\n"
-        "leaq (%%rbx,%%r8,1), %%r8\n"
-        "leal -1(%%rsi), %%r9d\n"
-        "cmpl $0x1d, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_one_byte_repeat_emit_lits_encodeBlockAsm2MB\n"
-        "subl $0x1d, %%r9d\n"
-        "cmpl $0x00000100, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_two_bytes_repeat_emit_lits_encodeBlockAsm2MB\n"
-        "cmpl $0x00010000, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_three_bytes_repeat_emit_lits_encodeBlockAsm2MB\n"
-        "movl %%r9d, %%r10d\n"
-        "shrl $0x10, %%r10d\n"
-        "movb $0xf8, (%%rcx)\n"
-        "movw %%r9w, 1(%%rcx)\n"
-        "movb %%r10b, 3(%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "addl $0x1d, %%r9d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_repeat_emit_lits_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_three_bytes_repeat_emit_lits_encodeBlockAsm2MB:\n"
-        "movb $0xf0, (%%rcx)\n"
-        "movw %%r9w, 1(%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "addl $0x1d, %%r9d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_repeat_emit_lits_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_two_bytes_repeat_emit_lits_encodeBlockAsm2MB:\n"
-        "movb $0xe8, (%%rcx)\n"
-        "movb %%r9b, 1(%%rcx)\n"
-        "addl $0x1d, %%r9d\n"
-        "addq $0x02, %%rcx\n"
-        "cmpl $0x40, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_memmove_midrepeat_emit_lits_encodeBlockAsm2MB\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_repeat_emit_lits_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_one_byte_repeat_emit_lits_encodeBlockAsm2MB:\n"
-        "shlb $0x03, %%r9b\n"
-        "movb %%r9b, (%%rcx)\n"
-        "addq $0x01, %%rcx\n"
-        "leaq (%%rcx,%%rsi,1), %%r9\n"
-        "cmpq $0x10, %%rsi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_8through16\n"
-        "cmpq $0x20, %%rsi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_17through32\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_33through64\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_8through16:\n"
-        "movdqu (%%r8), %%xmm0\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_repeat_emit_lits_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_17through32:\n"
-        "movdqu (%%r8), %%xmm0\n"
-        "movdqu -16(%%r8,%%rsi,1), %%xmm1\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, -16(%%rcx,%%rsi,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_repeat_emit_lits_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_33through64:\n"
-        "movdqu (%%r8), %%xmm0\n"
-        "movdqu 16(%%r8), %%xmm1\n"
-        "movdqu -32(%%r8,%%rsi,1), %%xmm2\n"
-        "movdqu -16(%%r8,%%rsi,1), %%xmm3\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%rsi,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%rsi,1)\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_end_copy_repeat_emit_lits_encodeBlockAsm2MB:\n"
-        "movq %%r9, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_emit_lits_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_midrepeat_emit_lits_encodeBlockAsm2MB:\n"
-        "leaq (%%rcx,%%rsi,1), %%r9\n"
-        "cmpq $0x20, %%rsi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_17through32\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_33through64\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_17through32:\n"
-        "movdqu (%%r8), %%xmm0\n"
-        "movdqu -16(%%r8,%%rsi,1), %%xmm1\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, -16(%%rcx,%%rsi,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_mid_end_copy_repeat_emit_lits_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_repeat_emit_lits_encodeBlockAsm2MB_memmove_move_33through64:\n"
-        "movdqu (%%r8), %%xmm0\n"
-        "movdqu 16(%%r8), %%xmm1\n"
-        "movdqu -32(%%r8,%%rsi,1), %%xmm2\n"
-        "movdqu -16(%%r8,%%rsi,1), %%xmm3\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%rsi,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%rsi,1)\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_mid_end_copy_repeat_emit_lits_encodeBlockAsm2MB:\n"
-        "movq %%r9, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_emit_lits_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_long_repeat_emit_lits_encodeBlockAsm2MB:\n"
-        "leaq (%%rcx,%%rsi,1), %%r9\n"
-        "movdqu (%%r8), %%xmm0\n"
-        "movdqu 16(%%r8), %%xmm1\n"
-        "movdqu -32(%%r8,%%rsi,1), %%xmm2\n"
-        "movdqu -16(%%r8,%%rsi,1), %%xmm3\n"
-        "movq %%rsi, %%r11\n"
-        "shrq $0x05, %%r11\n"
-        "movq %%rcx, %%r10\n"
-        "andl $0x0000001f, %%r10d\n"
-        "movq $0x00000040, %%r12\n"
-        "subq %%r10, %%r12\n"
-        "decq %%r11\n"
-        "ja .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_repeat_emit_lits_encodeBlockAsm2MBlarge_forward_sse_loop_32\n"
-        "leaq -32(%%r8,%%r12,1), %%r10\n"
-        "leaq -32(%%rcx,%%r12,1), %%r13\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_repeat_emit_lits_encodeBlockAsm2MBlarge_big_loop_back:\n"
-        "movdqu (%%r10), %%xmm4\n"
-        "movdqu 16(%%r10), %%xmm5\n"
-        "movdqa %%xmm4, (%%r13)\n"
-        "movdqa %%xmm5, 16(%%r13)\n"
-        "addq $0x20, %%r13\n"
-        "addq $0x20, %%r10\n"
-        "addq $0x20, %%r12\n"
-        "decq %%r11\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_repeat_emit_lits_encodeBlockAsm2MBlarge_big_loop_back\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_repeat_emit_lits_encodeBlockAsm2MBlarge_forward_sse_loop_32:\n"
-        "movdqu -32(%%r8,%%r12,1), %%xmm4\n"
-        "movdqu -16(%%r8,%%r12,1), %%xmm5\n"
-        "movdqa %%xmm4, -32(%%rcx,%%r12,1)\n"
-        "movdqa %%xmm5, -16(%%rcx,%%r12,1)\n"
-        "addq $0x20, %%r12\n"
-        "cmpq %%r12, %%rsi\n"
-        "jae .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_repeat_emit_lits_encodeBlockAsm2MBlarge_forward_sse_loop_32\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%rsi,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%rsi,1)\n"
-        "movq %%r9, %%rcx\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_emit_lits_end_encodeBlockAsm2MB:\n"
-        "addl $0x05, %%edx\n"
-        "movl %%edx, %%esi\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "subl %%ebp, %%esi\n"
-#else
-        "subl 16(%%rsp), %%esi\n"
-#endif
-        "movq 40(%%rsp), %%r8\n"
-        "subl %%edx, %%r8d\n"
-        "leaq (%%rbx,%%rdx,1), %%r9\n"
-        "leaq (%%rbx,%%rsi,1), %%rsi\n"
-        "xorl %%r11d, %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_loop_16_entry_repeat_extend_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_loopback_16_repeat_extend_encodeBlockAsm2MB:\n"
-        "movq (%%r9,%%r11,1), %%r10\n"
-        "movq 8(%%r9,%%r11,1), %%r12\n"
-        "xorq (%%rsi,%%r11,1), %%r10\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_repeat_extend_encodeBlockAsm2MB\n"
-        "xorq 8(%%rsi,%%r11,1), %%r12\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_16repeat_extend_encodeBlockAsm2MB\n"
-        "leal -16(%%r8), %%r8d\n"
-        "leal 16(%%r11), %%r11d\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_loop_16_entry_repeat_extend_encodeBlockAsm2MB:\n"
-        "cmpl $0x10, %%r8d\n"
-        "jae .Lminlz_l1_2mb_inline_%=_matchlen_loopback_16_repeat_extend_encodeBlockAsm2MB\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_match8_repeat_extend_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_bsf_16repeat_extend_encodeBlockAsm2MB:\n"
-        "tzcntq %%r12, %%r12\n"
-        "sarq $0x03, %%r12\n"
-        "leal 8(%%r11,%%r12,1), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_extend_forward_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match8_repeat_extend_encodeBlockAsm2MB:\n"
-        "cmpl $0x08, %%r8d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_matchlen_match4_repeat_extend_encodeBlockAsm2MB\n"
-        "movq (%%r9,%%r11,1), %%r10\n"
-        "xorq (%%rsi,%%r11,1), %%r10\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_repeat_extend_encodeBlockAsm2MB\n"
-        "leal -8(%%r8), %%r8d\n"
-        "leal 8(%%r11), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_match4_repeat_extend_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_repeat_extend_encodeBlockAsm2MB:\n"
-        "tzcntq %%r10, %%r10\n"
-        "sarq $0x03, %%r10\n"
-        "addl %%r10d, %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_extend_forward_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match4_repeat_extend_encodeBlockAsm2MB:\n"
-        "cmpl $0x04, %%r8d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_matchlen_match2_repeat_extend_encodeBlockAsm2MB\n"
-        "movl (%%r9,%%r11,1), %%r10d\n"
-        "cmpl %%r10d, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_matchlen_match2_repeat_extend_encodeBlockAsm2MB\n"
-        "leal -4(%%r8), %%r8d\n"
-        "leal 4(%%r11), %%r11d\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match2_repeat_extend_encodeBlockAsm2MB:\n"
-        "cmpl $0x01, %%r8d\n"
-        "je .Lminlz_l1_2mb_inline_%=_matchlen_match1_repeat_extend_encodeBlockAsm2MB\n"
-        "jb .Lminlz_l1_2mb_inline_%=_repeat_extend_forward_end_encodeBlockAsm2MB\n"
-        "movw (%%r9,%%r11,1), %%r10w\n"
-        "cmpw %%r10w, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_matchlen_match1_repeat_extend_encodeBlockAsm2MB\n"
-        "leal 2(%%r11), %%r11d\n"
-        "subl $0x02, %%r8d\n"
-        "jz .Lminlz_l1_2mb_inline_%=_repeat_extend_forward_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match1_repeat_extend_encodeBlockAsm2MB:\n"
-        "movb (%%r9,%%r11,1), %%r10b\n"
-        "cmpb %%r10b, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_repeat_extend_forward_end_encodeBlockAsm2MB\n"
-        "leal 1(%%r11), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_extend_forward_end_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_extend_forward_end_encodeBlockAsm2MB:\n"
-        "addl %%r11d, %%edx\n"
-        "movl %%edx, %%esi\n"
-        "subl %%edi, %%esi\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "movl %%ebp, %%edi\n"
-#else
-        "movl 16(%%rsp), %%edi\n"
-#endif
-        "leal -1(%%rsi), %%edi\n"
-        "cmpl $0x1d, %%esi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_repeat_one_match_repeat_encodeBlockAsm2MB\n"
-        "leal -30(%%rsi), %%edi\n"
-        "cmpl $0x0000011e, %%esi\n"
-        "jb .Lminlz_l1_2mb_inline_%=_repeat_two_match_repeat_encodeBlockAsm2MB\n"
-        "cmpl $0x0001001e, %%esi\n"
-        "jb .Lminlz_l1_2mb_inline_%=_repeat_three_match_repeat_encodeBlockAsm2MB\n"
-        "movb $0xfc, (%%rcx)\n"
-        "movl %%edi, 1(%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_end_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_three_match_repeat_encodeBlockAsm2MB:\n"
-        "movb $0xf4, (%%rcx)\n"
-        "movw %%di, 1(%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_end_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_two_match_repeat_encodeBlockAsm2MB:\n"
-        "movb $0xec, (%%rcx)\n"
-        "movb %%dil, 1(%%rcx)\n"
-        "addq $0x02, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_repeat_end_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_one_match_repeat_encodeBlockAsm2MB:\n"
-        "xorl %%edi, %%edi\n"
-        "leal -4(%%rdi,%%rsi,8), %%edi\n"
-        "movb %%dil, (%%rcx)\n"
-        "addq $0x01, %%rcx\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_end_emit_encodeBlockAsm2MB:\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "movl %%edx, %%r15d\n"
-#else
-        "movl %%edx, 12(%%rsp)\n"
-#endif
-        "jmp .Lminlz_l1_2mb_inline_%=_search_loop_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_no_repeat_found_encodeBlockAsm2MB:\n"
-        "cmpl %%edi, (%%rbx,%%rsi,1)\n"
-        "je .Lminlz_l1_2mb_inline_%=_candidate_match_encodeBlockAsm2MB\n"
-        "shrq $0x08, %%rdi\n"
-        "movl (%%rax,%%r10,4), %%esi\n"
-        "leal 2(%%rdx), %%r9d\n"
-        "cmpl %%edi, (%%rbx,%%r8,1)\n"
-        "je .Lminlz_l1_2mb_inline_%=_candidate2_match_encodeBlockAsm2MB\n"
-        "movl %%r9d, (%%rax,%%r10,4)\n"
-        "shrq $0x08, %%rdi\n"
-        "cmpl %%edi, (%%rbx,%%rsi,1)\n"
-        "je .Lminlz_l1_2mb_inline_%=_candidate3_match_encodeBlockAsm2MB\n"
-        "movl 20(%%rsp), %%edx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_search_loop_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_candidate3_match_encodeBlockAsm2MB:\n"
-        "addl $0x02, %%edx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_candidate_match_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_candidate2_match_encodeBlockAsm2MB:\n"
-        "movl %%r9d, (%%rax,%%r10,4)\n"
-        "incl %%edx\n"
-        "movl %%r8d, %%esi\n"
-        ".Lminlz_l1_2mb_inline_%=_candidate_match_encodeBlockAsm2MB:\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "movl %%r15d, %%edi\n"
-#else
-        "movl 12(%%rsp), %%edi\n"
-#endif
-        "testl %%esi, %%esi\n"
-        "jz .Lminlz_l1_2mb_inline_%=_match_extend_back_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_match_extend_back_loop_encodeBlockAsm2MB:\n"
-        "cmpl %%edi, %%edx\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_match_extend_back_end_encodeBlockAsm2MB\n"
-        "movb -1(%%rbx,%%rsi,1), %%r8b\n"
-        "movb -1(%%rbx,%%rdx,1), %%r9b\n"
-        "cmpb %%r9b, %%r8b\n"
-        "jne .Lminlz_l1_2mb_inline_%=_match_extend_back_end_encodeBlockAsm2MB\n"
-        "leal -1(%%rdx), %%edx\n"
-        "decl %%esi\n"
-        "jz .Lminlz_l1_2mb_inline_%=_match_extend_back_end_encodeBlockAsm2MB\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_extend_back_loop_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_match_extend_back_end_encodeBlockAsm2MB:\n"
-        "cmpq (%%rsp), %%rcx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_dst_size_check_ok_2\n"
-        "xorq %%rax, %%rax\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        ".Lminlz_l1_2mb_inline_%=_dst_size_check_ok_2:\n"
-        "movl %%edx, %%r8d\n"
-        "movl %%edx, %%edi\n"
-        "subl %%esi, %%edi\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "movl %%edi, %%ebp\n"
-#else
-        "movl %%edi, 16(%%rsp)\n"
-#endif
-        "addl $0x04, %%edx\n"
-        "addl $0x04, %%esi\n"
-        "movq 40(%%rsp), %%rdi\n"
-        "subl %%edx, %%edi\n"
-        "leaq (%%rbx,%%rdx,1), %%r9\n"
-        "leaq (%%rbx,%%rsi,1), %%rsi\n"
-        "xorl %%r11d, %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_loop_16_entry_match_nolit_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_loopback_16_match_nolit_encodeBlockAsm2MB:\n"
-        "movq (%%r9,%%r11,1), %%r10\n"
-        "movq 8(%%r9,%%r11,1), %%r12\n"
-        "xorq (%%rsi,%%r11,1), %%r10\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_match_nolit_encodeBlockAsm2MB\n"
-        "xorq 8(%%rsi,%%r11,1), %%r12\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_16match_nolit_encodeBlockAsm2MB\n"
-        "leal -16(%%rdi), %%edi\n"
-        "leal 16(%%r11), %%r11d\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_loop_16_entry_match_nolit_encodeBlockAsm2MB:\n"
-        "cmpl $0x10, %%edi\n"
-        "jae .Lminlz_l1_2mb_inline_%=_matchlen_loopback_16_match_nolit_encodeBlockAsm2MB\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_match8_match_nolit_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_bsf_16match_nolit_encodeBlockAsm2MB:\n"
-        "tzcntq %%r12, %%r12\n"
-        "sarq $0x03, %%r12\n"
-        "leal 8(%%r11,%%r12,1), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match8_match_nolit_encodeBlockAsm2MB:\n"
-        "cmpl $0x08, %%edi\n"
-        "jb .Lminlz_l1_2mb_inline_%=_matchlen_match4_match_nolit_encodeBlockAsm2MB\n"
-        "movq (%%r9,%%r11,1), %%r10\n"
-        "xorq (%%rsi,%%r11,1), %%r10\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_match_nolit_encodeBlockAsm2MB\n"
-        "leal -8(%%rdi), %%edi\n"
-        "leal 8(%%r11), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_match4_match_nolit_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_match_nolit_encodeBlockAsm2MB:\n"
-        "tzcntq %%r10, %%r10\n"
-        "sarq $0x03, %%r10\n"
-        "addl %%r10d, %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match4_match_nolit_encodeBlockAsm2MB:\n"
-        "cmpl $0x04, %%edi\n"
-        "jb .Lminlz_l1_2mb_inline_%=_matchlen_match2_match_nolit_encodeBlockAsm2MB\n"
-        "movl (%%r9,%%r11,1), %%r10d\n"
-        "cmpl %%r10d, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_matchlen_match2_match_nolit_encodeBlockAsm2MB\n"
-        "leal -4(%%rdi), %%edi\n"
-        "leal 4(%%r11), %%r11d\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match2_match_nolit_encodeBlockAsm2MB:\n"
-        "cmpl $0x01, %%edi\n"
-        "je .Lminlz_l1_2mb_inline_%=_matchlen_match1_match_nolit_encodeBlockAsm2MB\n"
-        "jb .Lminlz_l1_2mb_inline_%=_match_nolit_end_encodeBlockAsm2MB\n"
-        "movw (%%r9,%%r11,1), %%r10w\n"
-        "cmpw %%r10w, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_matchlen_match1_match_nolit_encodeBlockAsm2MB\n"
-        "leal 2(%%r11), %%r11d\n"
-        "subl $0x02, %%edi\n"
-        "jz .Lminlz_l1_2mb_inline_%=_match_nolit_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match1_match_nolit_encodeBlockAsm2MB:\n"
-        "movb (%%r9,%%r11,1), %%r10b\n"
-        "cmpb %%r10b, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_match_nolit_end_encodeBlockAsm2MB\n"
-        "leal 1(%%r11), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_end_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_match_nolit_end_encodeBlockAsm2MB:\n"
-        "addl %%r11d, %%edx\n"
-        "addl $0x04, %%r11d\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "movl %%ebp, %%esi\n"
-#else
-        "movl 16(%%rsp), %%esi\n"
-#endif
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "movl %%r15d, %%edi\n"
-        "movl %%edx, %%r15d\n"
-#else
-        "movl 12(%%rsp), %%edi\n"
-        "movl %%edx, 12(%%rsp)\n"
-#endif
-        "subl %%edi, %%r8d\n"
-        "jz .Lminlz_l1_2mb_inline_%=_match_nolits_copy_encodeBlockAsm2MB\n"
-        "leaq (%%rbx,%%rdi,1), %%rdi\n"
-        "cmpl $0x03, %%r8d\n"
-        "ja .Lminlz_l1_2mb_inline_%=_match_emit_lits_copy_encodeBlockAsm2MB\n"
-        "cmpl $0x40, %%esi\n"
-        "jb .Lminlz_l1_2mb_inline_%=_match_emit_lits_copy_encodeBlockAsm2MB\n"
-        "movl (%%rdi), %%edi\n"
-        "cmpl $0x0001003f, %%esi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_match_emit_copy2lits_encodeBlockAsm2MB\n"
-        "leal -4(%%r11), %%r11d\n"
-        "leal -65536(%%rsi), %%esi\n"
-        "shll $0x0b, %%esi\n"
-        "leal 7(%%rsi,%%r8,8), %%esi\n"
-        "cmpl $0x3c, %%r11d\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_copy3_0_match_emit_lits_encodeBlockAsm2MB\n"
-        "leal -60(%%r11), %%r9d\n"
-        "cmpl $0x0000013c, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_emit_copy3_1_match_emit_lits_encodeBlockAsm2MB\n"
-        "cmpl $0x0001003c, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_emit_copy3_2_match_emit_lits_encodeBlockAsm2MB\n"
-        "addl $0x000007e0, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "movl %%r9d, 4(%%rcx)\n"
-        "addq $0x07, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_emit_copy_litsencodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy3_2_match_emit_lits_encodeBlockAsm2MB:\n"
-        "addl $0x000007c0, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "movw %%r9w, 4(%%rcx)\n"
-        "addq $0x06, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_emit_copy_litsencodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy3_1_match_emit_lits_encodeBlockAsm2MB:\n"
-        "addl $0x000007a0, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "movb %%r9b, 4(%%rcx)\n"
-        "addq $0x05, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_emit_copy_litsencodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy3_0_match_emit_lits_encodeBlockAsm2MB:\n"
-        "shll $0x05, %%r11d\n"
-        "orl %%r11d, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        ".Lminlz_l1_2mb_inline_%=_match_emit_copy_litsencodeBlockAsm2MB:\n"
-        "movl %%edi, (%%rcx)\n"
-        "addq %%r8, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_match_emit_copy2lits_encodeBlockAsm2MB:\n"
-        "xorq %%r9, %%r9\n"
-        "subl $0x40, %%esi\n"
-        "leal -11(%%r11), %%r10d\n"
-        "leal -4(%%r11), %%r11d\n"
-        "movw %%si, 1(%%rcx)\n"
-        "cmpl $0x07, %%r11d\n"
-        "cmovgel %%r10d, %%r9d\n"
-        "movq $0x00000007, %%rsi\n"
-        "cmovll %%r11d, %%esi\n"
-        "leal -1(%%r8,%%rsi,4), %%esi\n"
-        "movl $0x00000003, %%r10d\n"
-        "leal (%%r10,%%rsi,8), %%esi\n"
-        "movb %%sil, (%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "movl %%edi, (%%rcx)\n"
-        "addq %%r8, %%rcx\n"
-        "testl %%r9d, %%r9d\n"
-        "jz .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        "leal -1(%%r9), %%esi\n"
-        "cmpl $0x1d, %%r9d\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_repeat_one_match_emit_repeat_copy2_encodeBlockAsm2MB\n"
-        "leal -30(%%r9), %%esi\n"
-        "cmpl $0x0000011e, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_repeat_two_match_emit_repeat_copy2_encodeBlockAsm2MB\n"
-        "cmpl $0x0001001e, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_repeat_three_match_emit_repeat_copy2_encodeBlockAsm2MB\n"
-        "movb $0xfc, (%%rcx)\n"
-        "movl %%esi, 1(%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_three_match_emit_repeat_copy2_encodeBlockAsm2MB:\n"
-        "movb $0xf4, (%%rcx)\n"
-        "movw %%si, 1(%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_two_match_emit_repeat_copy2_encodeBlockAsm2MB:\n"
-        "movb $0xec, (%%rcx)\n"
-        "movb %%sil, 1(%%rcx)\n"
-        "addq $0x02, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_one_match_emit_repeat_copy2_encodeBlockAsm2MB:\n"
-        "xorl %%esi, %%esi\n"
-        "leal -4(%%rsi,%%r9,8), %%esi\n"
-        "movb %%sil, (%%rcx)\n"
-        "addq $0x01, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_match_emit_lits_copy_encodeBlockAsm2MB:\n"
-        "leaq 4(%%rcx,%%r8,1), %%r9\n"
-        "cmpq (%%rsp), %%r9\n"
-        "jb .Lminlz_l1_2mb_inline_%=_dst_size_check_ok_3\n"
-        "xorq %%rax, %%rax\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        ".Lminlz_l1_2mb_inline_%=_dst_size_check_ok_3:\n"
-        "leal -1(%%r8), %%r9d\n"
-        "cmpl $0x1d, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_one_byte_match_emit_encodeBlockAsm2MB\n"
-        "subl $0x1d, %%r9d\n"
-        "cmpl $0x00000100, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_two_bytes_match_emit_encodeBlockAsm2MB\n"
-        "cmpl $0x00010000, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_three_bytes_match_emit_encodeBlockAsm2MB\n"
-        "movl %%r9d, %%r10d\n"
-        "shrl $0x10, %%r10d\n"
-        "movb $0xf8, (%%rcx)\n"
-        "movw %%r9w, 1(%%rcx)\n"
-        "movb %%r10b, 3(%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "addl $0x1d, %%r9d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_match_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_three_bytes_match_emit_encodeBlockAsm2MB:\n"
-        "movb $0xf0, (%%rcx)\n"
-        "movw %%r9w, 1(%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "addl $0x1d, %%r9d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_match_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_two_bytes_match_emit_encodeBlockAsm2MB:\n"
-        "movb $0xe8, (%%rcx)\n"
-        "movb %%r9b, 1(%%rcx)\n"
-        "addl $0x1d, %%r9d\n"
-        "addq $0x02, %%rcx\n"
-        "cmpl $0x40, %%r9d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_memmove_midmatch_emit_encodeBlockAsm2MB\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_match_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_one_byte_match_emit_encodeBlockAsm2MB:\n"
-        "shlb $0x03, %%r9b\n"
-        "movb %%r9b, (%%rcx)\n"
-        "addq $0x01, %%rcx\n"
-        "leaq (%%rcx,%%r8,1), %%r9\n"
-        "cmpq $0x10, %%r8\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_match_emit_encodeBlockAsm2MB_memmove_move_8through16\n"
-        "cmpq $0x20, %%r8\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_match_emit_encodeBlockAsm2MB_memmove_move_17through32\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_match_emit_encodeBlockAsm2MB_memmove_move_33through64\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_match_emit_encodeBlockAsm2MB_memmove_move_8through16:\n"
-        "movdqu (%%rdi), %%xmm0\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_match_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_match_emit_encodeBlockAsm2MB_memmove_move_17through32:\n"
-        "movdqu (%%rdi), %%xmm0\n"
-        "movdqu -16(%%rdi,%%r8,1), %%xmm1\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, -16(%%rcx,%%r8,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_match_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_match_emit_encodeBlockAsm2MB_memmove_move_33through64:\n"
-        "movdqu (%%rdi), %%xmm0\n"
-        "movdqu 16(%%rdi), %%xmm1\n"
-        "movdqu -32(%%rdi,%%r8,1), %%xmm2\n"
-        "movdqu -16(%%rdi,%%r8,1), %%xmm3\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%r8,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%r8,1)\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_end_copy_match_emit_encodeBlockAsm2MB:\n"
-        "movq %%r9, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolits_copy_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_midmatch_emit_encodeBlockAsm2MB:\n"
-        "leaq (%%rcx,%%r8,1), %%r9\n"
-        "cmpq $0x20, %%r8\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_match_emit_encodeBlockAsm2MB_memmove_move_17through32\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_match_emit_encodeBlockAsm2MB_memmove_move_33through64\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_match_emit_encodeBlockAsm2MB_memmove_move_17through32:\n"
-        "movdqu (%%rdi), %%xmm0\n"
-        "movdqu -16(%%rdi,%%r8,1), %%xmm1\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, -16(%%rcx,%%r8,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_mid_end_copy_match_emit_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_match_emit_encodeBlockAsm2MB_memmove_move_33through64:\n"
-        "movdqu (%%rdi), %%xmm0\n"
-        "movdqu 16(%%rdi), %%xmm1\n"
-        "movdqu -32(%%rdi,%%r8,1), %%xmm2\n"
-        "movdqu -16(%%rdi,%%r8,1), %%xmm3\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%r8,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%r8,1)\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_mid_end_copy_match_emit_encodeBlockAsm2MB:\n"
-        "movq %%r9, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolits_copy_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_long_match_emit_encodeBlockAsm2MB:\n"
-        "leaq (%%rcx,%%r8,1), %%r9\n"
-        "movdqu (%%rdi), %%xmm0\n"
-        "movdqu 16(%%rdi), %%xmm1\n"
-        "movdqu -32(%%rdi,%%r8,1), %%xmm2\n"
-        "movdqu -16(%%rdi,%%r8,1), %%xmm3\n"
-        "movq %%r8, %%r12\n"
-        "shrq $0x05, %%r12\n"
-        "movq %%rcx, %%r10\n"
-        "andl $0x0000001f, %%r10d\n"
-        "movq $0x00000040, %%r13\n"
-        "subq %%r10, %%r13\n"
-        "decq %%r12\n"
-        "ja .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_match_emit_encodeBlockAsm2MBlarge_forward_sse_loop_32\n"
-        "leaq -32(%%rdi,%%r13,1), %%r10\n"
-        "leaq -32(%%rcx,%%r13,1), %%r14\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_match_emit_encodeBlockAsm2MBlarge_big_loop_back:\n"
-        "movdqu (%%r10), %%xmm4\n"
-        "movdqu 16(%%r10), %%xmm5\n"
-        "movdqa %%xmm4, (%%r14)\n"
-        "movdqa %%xmm5, 16(%%r14)\n"
-        "addq $0x20, %%r14\n"
-        "addq $0x20, %%r10\n"
-        "addq $0x20, %%r13\n"
-        "decq %%r12\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_match_emit_encodeBlockAsm2MBlarge_big_loop_back\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_match_emit_encodeBlockAsm2MBlarge_forward_sse_loop_32:\n"
-        "movdqu -32(%%rdi,%%r13,1), %%xmm4\n"
-        "movdqu -16(%%rdi,%%r13,1), %%xmm5\n"
-        "movdqa %%xmm4, -32(%%rcx,%%r13,1)\n"
-        "movdqa %%xmm5, -16(%%rcx,%%r13,1)\n"
-        "addq $0x20, %%r13\n"
-        "cmpq %%r13, %%r8\n"
-        "jae .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_match_emit_encodeBlockAsm2MBlarge_forward_sse_loop_32\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%r8,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%r8,1)\n"
-        "movq %%r9, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolits_copy_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_match_nolits_copy_encodeBlockAsm2MB:\n"
-        "cmpl $0x0001003f, %%esi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_two_byte_offset_match_nolit_encodeBlockAsm2MB\n"
-        "leal -4(%%r11), %%r11d\n"
-        "leal -65536(%%rsi), %%esi\n"
-        "shll $0x0b, %%esi\n"
-        "addl $0x07, %%esi\n"
-        "cmpl $0x3c, %%r11d\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_copy3_0_match_nolit_encodeBlockAsm2MB_emit3\n"
-        "leal -60(%%r11), %%edi\n"
-        "cmpl $0x0000013c, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_emit_copy3_1_match_nolit_encodeBlockAsm2MB_emit3\n"
-        "cmpl $0x0001003c, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_emit_copy3_2_match_nolit_encodeBlockAsm2MB_emit3\n"
-        "addl $0x000007e0, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "movl %%edi, 4(%%rcx)\n"
-        "addq $0x07, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy3_2_match_nolit_encodeBlockAsm2MB_emit3:\n"
-        "addl $0x000007c0, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "movw %%di, 4(%%rcx)\n"
-        "addq $0x06, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy3_1_match_nolit_encodeBlockAsm2MB_emit3:\n"
-        "addl $0x000007a0, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "movb %%dil, 4(%%rcx)\n"
-        "addq $0x05, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy3_0_match_nolit_encodeBlockAsm2MB_emit3:\n"
-        "shll $0x05, %%r11d\n"
-        "orl %%r11d, %%esi\n"
-        "movl %%esi, (%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_two_byte_offset_match_nolit_encodeBlockAsm2MB:\n"
-        "cmpl $0x00000400, %%esi\n"
-        "ja .Lminlz_l1_2mb_inline_%=_two_byte_match_nolit_encodeBlockAsm2MB\n"
-        "cmpl $0x00000013, %%r11d\n"
-        "jae .Lminlz_l1_2mb_inline_%=_emit_one_longer_match_nolit_encodeBlockAsm2MB\n"
-        "leal -1(%%rsi), %%esi\n"
-        "shll $0x06, %%esi\n"
-        "leal -15(%%rsi,%%r11,4), %%esi\n"
-        "movw %%si, (%%rcx)\n"
-        "addq $0x02, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_one_longer_match_nolit_encodeBlockAsm2MB:\n"
-        "cmpl $0x00000112, %%r11d\n"
-        "jae .Lminlz_l1_2mb_inline_%=_emit_copy1_repeat_match_nolit_encodeBlockAsm2MB\n"
-        "leal -1(%%rsi), %%esi\n"
-        "shll $0x06, %%esi\n"
-        "leal 61(%%rsi), %%esi\n"
-        "movw %%si, (%%rcx)\n"
-        "leal -18(%%r11), %%esi\n"
-        "movb %%sil, 2(%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy1_repeat_match_nolit_encodeBlockAsm2MB:\n"
-        "leal -1(%%rsi), %%esi\n"
-        "shll $0x06, %%esi\n"
-        "leal 57(%%rsi), %%esi\n"
-        "movw %%si, (%%rcx)\n"
-        "addq $0x02, %%rcx\n"
-        "subl $0x12, %%r11d\n"
-        "leal -1(%%r11), %%esi\n"
-        "cmpl $0x1d, %%r11d\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_repeat_one_emit_copy1_do_repeat_match_nolit_encodeBlockAsm2MB\n"
-        "leal -30(%%r11), %%esi\n"
-        "cmpl $0x0000011e, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_repeat_two_emit_copy1_do_repeat_match_nolit_encodeBlockAsm2MB\n"
-        "cmpl $0x0001001e, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_repeat_three_emit_copy1_do_repeat_match_nolit_encodeBlockAsm2MB\n"
-        "movb $0xfc, (%%rcx)\n"
-        "movl %%esi, 1(%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_three_emit_copy1_do_repeat_match_nolit_encodeBlockAsm2MB:\n"
-        "movb $0xf4, (%%rcx)\n"
-        "movw %%si, 1(%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_two_emit_copy1_do_repeat_match_nolit_encodeBlockAsm2MB:\n"
-        "movb $0xec, (%%rcx)\n"
-        "movb %%sil, 1(%%rcx)\n"
-        "addq $0x02, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_repeat_one_emit_copy1_do_repeat_match_nolit_encodeBlockAsm2MB:\n"
-        "xorl %%esi, %%esi\n"
-        "leal -4(%%rsi,%%r11,8), %%esi\n"
-        "movb %%sil, (%%rcx)\n"
-        "addq $0x01, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_two_byte_match_nolit_encodeBlockAsm2MB:\n"
-        "leal -64(%%rsi), %%esi\n"
-        "leal -4(%%r11), %%r11d\n"
-        "movw %%si, 1(%%rcx)\n"
-        "cmpl $0x3c, %%r11d\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_copy2_0_match_nolit_encodeBlockAsm2MB_emit2\n"
-        "leal -60(%%r11), %%esi\n"
-        "cmpl $0x0000013c, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_emit_copy2_1_match_nolit_encodeBlockAsm2MB_emit2\n"
-        "cmpl $0x0001003c, %%r11d\n"
-        "jb .Lminlz_l1_2mb_inline_%=_emit_copy2_2_match_nolit_encodeBlockAsm2MB_emit2\n"
-        "movb $0xfe, (%%rcx)\n"
-        "movl %%esi, 3(%%rcx)\n"
-        "addq $0x06, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy2_2_match_nolit_encodeBlockAsm2MB_emit2:\n"
-        "movb $0xfa, (%%rcx)\n"
-        "movw %%si, 3(%%rcx)\n"
-        "addq $0x05, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy2_1_match_nolit_encodeBlockAsm2MB_emit2:\n"
-        "movb $0xf6, (%%rcx)\n"
-        "movb %%sil, 3(%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_copy2_0_match_nolit_encodeBlockAsm2MB_emit2:\n"
-        "movl $0x00000002, %%esi\n"
-        "leal (%%rsi,%%r11,4), %%esi\n"
-        "movb %%sil, (%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        ".Lminlz_l1_2mb_inline_%=_match_nolit_emitcopy_end_encodeBlockAsm2MB:\n"
-        "cmpl 8(%%rsp), %%edx\n"
-        "jae .Lminlz_l1_2mb_inline_%=_emit_remainder_encodeBlockAsm2MB\n"
-        "movq -2(%%rbx,%%rdx,1), %%rdi\n"
-        "cmpq (%%rsp), %%rcx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_match_nolit_dst_ok_encodeBlockAsm2MB\n"
-        "xorq %%rax, %%rax\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        ".Lminlz_l1_2mb_inline_%=_match_nolit_dst_ok_encodeBlockAsm2MB:\n"
-        "movq $0x0000cf1bbcdcbf9b, %%rsi\n"
-        "movq %%rdi, %%r8\n"
-        "shrq $0x10, %%rdi\n"
-        "movq %%rdi, %%r9\n"
-        "shlq $0x10, %%r8\n"
-        "imulq %%rsi, %%r8\n"
-        "shrq $0x31, %%r8\n"
-        "shlq $0x10, %%r9\n"
-        "imulq %%rsi, %%r9\n"
-        "shrq $0x31, %%r9\n"
-        "leal -2(%%rdx), %%r10d\n"
-        "movl (%%rax,%%r9,4), %%esi\n"
-        "movl %%r10d, (%%rax,%%r8,4)\n"
-        "movl %%edx, (%%rax,%%r9,4)\n"
-        "movl %%edx, %%r8d\n"
-        "incl %%edx\n"
-        "cmpl %%edi, (%%rbx,%%rsi,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_search_loop_encodeBlockAsm2MB\n"
-        "movl %%r8d, %%edi\n"
-        "subl %%esi, %%edi\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "movl %%edi, %%ebp\n"
-#else
-        "movl %%edi, 16(%%rsp)\n"
-#endif
-        "cmpq (%%rsp), %%rcx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_dst_size_check_ok_4\n"
-        "xorq %%rax, %%rax\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        ".Lminlz_l1_2mb_inline_%=_dst_size_check_ok_4:\n"
-        "addl $0x03, %%edx\n"
-        "addl $0x04, %%esi\n"
-        "movq 40(%%rsp), %%rdi\n"
-        "subl %%edx, %%edi\n"
-        "leaq (%%rbx,%%rdx,1), %%r8\n"
-        "leaq (%%rbx,%%rsi,1), %%rsi\n"
-        "xorl %%r11d, %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_loop_16_entry_match_nolit2_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_loopback_16_match_nolit2_encodeBlockAsm2MB:\n"
-        "movq (%%r8,%%r11,1), %%r9\n"
-        "movq 8(%%r8,%%r11,1), %%r10\n"
-        "xorq (%%rsi,%%r11,1), %%r9\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_match_nolit2_encodeBlockAsm2MB\n"
-        "xorq 8(%%rsi,%%r11,1), %%r10\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_16match_nolit2_encodeBlockAsm2MB\n"
-        "leal -16(%%rdi), %%edi\n"
-        "leal 16(%%r11), %%r11d\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_loop_16_entry_match_nolit2_encodeBlockAsm2MB:\n"
-        "cmpl $0x10, %%edi\n"
-        "jae .Lminlz_l1_2mb_inline_%=_matchlen_loopback_16_match_nolit2_encodeBlockAsm2MB\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_match8_match_nolit2_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_bsf_16match_nolit2_encodeBlockAsm2MB:\n"
-        "tzcntq %%r10, %%r10\n"
-        "sarq $0x03, %%r10\n"
-        "leal 8(%%r11,%%r10,1), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit2_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match8_match_nolit2_encodeBlockAsm2MB:\n"
-        "cmpl $0x08, %%edi\n"
-        "jb .Lminlz_l1_2mb_inline_%=_matchlen_match4_match_nolit2_encodeBlockAsm2MB\n"
-        "movq (%%r8,%%r11,1), %%r9\n"
-        "xorq (%%rsi,%%r11,1), %%r9\n"
-        "jnz .Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_match_nolit2_encodeBlockAsm2MB\n"
-        "leal -8(%%rdi), %%edi\n"
-        "leal 8(%%r11), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_matchlen_match4_match_nolit2_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_bsf_8_match_nolit2_encodeBlockAsm2MB:\n"
-        "tzcntq %%r9, %%r9\n"
-        "sarq $0x03, %%r9\n"
-        "addl %%r9d, %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit2_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match4_match_nolit2_encodeBlockAsm2MB:\n"
-        "cmpl $0x04, %%edi\n"
-        "jb .Lminlz_l1_2mb_inline_%=_matchlen_match2_match_nolit2_encodeBlockAsm2MB\n"
-        "movl (%%r8,%%r11,1), %%r9d\n"
-        "cmpl %%r9d, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_matchlen_match2_match_nolit2_encodeBlockAsm2MB\n"
-        "leal -4(%%rdi), %%edi\n"
-        "leal 4(%%r11), %%r11d\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match2_match_nolit2_encodeBlockAsm2MB:\n"
-        "cmpl $0x01, %%edi\n"
-        "je .Lminlz_l1_2mb_inline_%=_matchlen_match1_match_nolit2_encodeBlockAsm2MB\n"
-        "jb .Lminlz_l1_2mb_inline_%=_match_nolit2_end_encodeBlockAsm2MB\n"
-        "movw (%%r8,%%r11,1), %%r9w\n"
-        "cmpw %%r9w, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_matchlen_match1_match_nolit2_encodeBlockAsm2MB\n"
-        "leal 2(%%r11), %%r11d\n"
-        "subl $0x02, %%edi\n"
-        "jz .Lminlz_l1_2mb_inline_%=_match_nolit2_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_matchlen_match1_match_nolit2_encodeBlockAsm2MB:\n"
-        "movb (%%r8,%%r11,1), %%r9b\n"
-        "cmpb %%r9b, (%%rsi,%%r11,1)\n"
-        "jne .Lminlz_l1_2mb_inline_%=_match_nolit2_end_encodeBlockAsm2MB\n"
-        "leal 1(%%r11), %%r11d\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolit2_end_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_match_nolit2_end_encodeBlockAsm2MB:\n"
-        "addl %%r11d, %%edx\n"
-        "addl $0x04, %%r11d\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "movl %%edx, %%r15d\n"
-#else
-        "movl %%edx, 12(%%rsp)\n"
-#endif
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "movl %%ebp, %%esi\n"
-#else
-        "movl 16(%%rsp), %%esi\n"
-#endif
-        "jmp .Lminlz_l1_2mb_inline_%=_match_nolits_copy_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_remainder_encodeBlockAsm2MB:\n"
-        "movq 40(%%rsp), %%rax\n"
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "movl %%r15d, %%edx\n"
-#else
-        "movl 12(%%rsp), %%edx\n"
-#endif
-        "subl %%edx, %%eax\n"
-        "jz .Lminlz_l1_2mb_inline_%=_emit_remainder_end_encodeBlockAsm2MB\n"
-        "leaq (%%rbx,%%rdx,1), %%rdx\n"
-        "leaq 4(%%rcx,%%rax,1), %%rbx\n"
-        "cmpq (%%rsp), %%rbx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_dst_size_check_ok_5\n"
-        "xorq %%rax, %%rax\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        ".Lminlz_l1_2mb_inline_%=_dst_size_check_ok_5:\n"
-        "leal -1(%%rax), %%ebx\n"
-        "cmpl $0x1d, %%ebx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_one_byte_emit_remainder_encodeBlockAsm2MB\n"
-        "subl $0x1d, %%ebx\n"
-        "cmpl $0x00000100, %%ebx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_two_bytes_emit_remainder_encodeBlockAsm2MB\n"
-        "cmpl $0x00010000, %%ebx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_three_bytes_emit_remainder_encodeBlockAsm2MB\n"
-        "movl %%ebx, %%esi\n"
-        "shrl $0x10, %%esi\n"
-        "movb $0xf8, (%%rcx)\n"
-        "movw %%bx, 1(%%rcx)\n"
-        "movb %%sil, 3(%%rcx)\n"
-        "addq $0x04, %%rcx\n"
-        "addl $0x1d, %%ebx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_three_bytes_emit_remainder_encodeBlockAsm2MB:\n"
-        "movb $0xf0, (%%rcx)\n"
-        "movw %%bx, 1(%%rcx)\n"
-        "addq $0x03, %%rcx\n"
-        "addl $0x1d, %%ebx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_two_bytes_emit_remainder_encodeBlockAsm2MB:\n"
-        "movb $0xe8, (%%rcx)\n"
-        "movb %%bl, 1(%%rcx)\n"
-        "addl $0x1d, %%ebx\n"
-        "addq $0x02, %%rcx\n"
-        "cmpl $0x40, %%ebx\n"
-        "jb .Lminlz_l1_2mb_inline_%=_memmove_midemit_remainder_encodeBlockAsm2MB\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_long_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_one_byte_emit_remainder_encodeBlockAsm2MB:\n"
-        "shlb $0x03, %%bl\n"
-        "movb %%bl, (%%rcx)\n"
-        "addq $0x01, %%rcx\n"
-        "leaq (%%rcx,%%rax,1), %%rbx\n"
-        "cmpq $0x03, %%rax\n"
-        "jb .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_1or2\n"
-        "je .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_3\n"
-        "cmpq $0x08, %%rax\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_4through8\n"
-        "cmpq $0x10, %%rax\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_8through16\n"
-        "cmpq $0x20, %%rax\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_17through32\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_33through64\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_1or2:\n"
-        "movb (%%rdx), %%sil\n"
-        "movb -1(%%rdx,%%rax,1), %%dl\n"
-        "movb %%sil, (%%rcx)\n"
-        "movb %%dl, -1(%%rcx,%%rax,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_3:\n"
-        "movw (%%rdx), %%si\n"
-        "movb 2(%%rdx), %%dl\n"
-        "movw %%si, (%%rcx)\n"
-        "movb %%dl, 2(%%rcx)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_4through8:\n"
-        "movl (%%rdx), %%esi\n"
-        "movl -4(%%rdx,%%rax,1), %%edx\n"
-        "movl %%esi, (%%rcx)\n"
-        "movl %%edx, -4(%%rcx,%%rax,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_emit_remainder_encodeBlockAsm2MB\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_8through16:\n"
-        "movq (%%rdx), %%rsi\n"
-        "movq -8(%%rdx,%%rax,1), %%rdx\n"
-        "movq %%rsi, (%%rcx)\n"
-        "movq %%rdx, -8(%%rcx,%%rax,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_17through32:\n"
-        "movdqu (%%rdx), %%xmm0\n"
-        "movdqu -16(%%rdx,%%rax,1), %%xmm1\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, -16(%%rcx,%%rax,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_end_copy_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_emit_remainder_encodeBlockAsm2MB_memmove_move_33through64:\n"
-        "movdqu (%%rdx), %%xmm0\n"
-        "movdqu 16(%%rdx), %%xmm1\n"
-        "movdqu -32(%%rdx,%%rax,1), %%xmm2\n"
-        "movdqu -16(%%rdx,%%rax,1), %%xmm3\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%rax,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%rax,1)\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_end_copy_emit_remainder_encodeBlockAsm2MB:\n"
-        "movq %%rbx, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_remainder_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_midemit_remainder_encodeBlockAsm2MB:\n"
-        "leaq (%%rcx,%%rax,1), %%rbx\n"
-        "cmpq $0x20, %%rax\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_emit_remainder_encodeBlockAsm2MB_memmove_move_17through32\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_emit_remainder_encodeBlockAsm2MB_memmove_move_33through64\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_emit_remainder_encodeBlockAsm2MB_memmove_move_17through32:\n"
-        "movdqu (%%rdx), %%xmm0\n"
-        "movdqu -16(%%rdx,%%rax,1), %%xmm1\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, -16(%%rcx,%%rax,1)\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_memmove_mid_end_copy_emit_remainder_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_mid_emit_remainder_encodeBlockAsm2MB_memmove_move_33through64:\n"
-        "movdqu (%%rdx), %%xmm0\n"
-        "movdqu 16(%%rdx), %%xmm1\n"
-        "movdqu -32(%%rdx,%%rax,1), %%xmm2\n"
-        "movdqu -16(%%rdx,%%rax,1), %%xmm3\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%rax,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%rax,1)\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_mid_end_copy_emit_remainder_encodeBlockAsm2MB:\n"
-        "movq %%rbx, %%rcx\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_emit_remainder_end_encodeBlockAsm2MB\n"
-        ".Lminlz_l1_2mb_inline_%=_memmove_long_emit_remainder_encodeBlockAsm2MB:\n"
-        "leaq (%%rcx,%%rax,1), %%rbx\n"
-        "movdqu (%%rdx), %%xmm0\n"
-        "movdqu 16(%%rdx), %%xmm1\n"
-        "movdqu -32(%%rdx,%%rax,1), %%xmm2\n"
-        "movdqu -16(%%rdx,%%rax,1), %%xmm3\n"
-        "movq %%rax, %%rdi\n"
-        "shrq $0x05, %%rdi\n"
-        "movq %%rcx, %%rsi\n"
-        "andl $0x0000001f, %%esi\n"
-        "movq $0x00000040, %%r8\n"
-        "subq %%rsi, %%r8\n"
-        "decq %%rdi\n"
-        "ja .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_emit_remainder_encodeBlockAsm2MBlarge_forward_sse_loop_32\n"
-        "leaq -32(%%rdx,%%r8,1), %%rsi\n"
-        "leaq -32(%%rcx,%%r8,1), %%r9\n"
-        ".p2align 4\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_emit_remainder_encodeBlockAsm2MBlarge_big_loop_back:\n"
-        "movdqu (%%rsi), %%xmm4\n"
-        "movdqu 16(%%rsi), %%xmm5\n"
-        "movdqa %%xmm4, (%%r9)\n"
-        "movdqa %%xmm5, 16(%%r9)\n"
-        "addq $0x20, %%r9\n"
-        "addq $0x20, %%rsi\n"
-        "addq $0x20, %%r8\n"
-        "decq %%rdi\n"
-        "jbe .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_emit_remainder_encodeBlockAsm2MBlarge_big_loop_back\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_emit_remainder_encodeBlockAsm2MBlarge_forward_sse_loop_32:\n"
-        "movdqu -32(%%rdx,%%r8,1), %%xmm4\n"
-        "movdqu -16(%%rdx,%%r8,1), %%xmm5\n"
-        "movdqa %%xmm4, -32(%%rcx,%%r8,1)\n"
-        "movdqa %%xmm5, -16(%%rcx,%%r8,1)\n"
-        "addq $0x20, %%r8\n"
-        "cmpq %%r8, %%rax\n"
-        "jae .Lminlz_l1_2mb_inline_%=_emit_lit_memmove_long_emit_remainder_encodeBlockAsm2MBlarge_forward_sse_loop_32\n"
-        "movdqu %%xmm0, (%%rcx)\n"
-        "movdqu %%xmm1, 16(%%rcx)\n"
-        "movdqu %%xmm2, -32(%%rcx,%%rax,1)\n"
-        "movdqu %%xmm3, -16(%%rcx,%%rax,1)\n"
-        "movq %%rbx, %%rcx\n"
-        ".Lminlz_l1_2mb_inline_%=_emit_remainder_end_encodeBlockAsm2MB:\n"
-        "movq 24(%%rsp), %%rax\n"
-        "subq %%rax, %%rcx\n"
-        "movq %%rcx, %%rax\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        "jmp .Lminlz_l1_2mb_inline_%=_epilogue\n"
-        ".Lminlz_l1_2mb_inline_%=_epilogue:\n"
-        "addq $64, %%rsp\n"
-#if MINLZ_L1_2MB_REG_LAST_OFFSET
-        "popq %%rbp\n"
-#endif
-#if MINLZ_L1_2MB_REG_NEXT_EMIT
-        "popq %%r15\n"
-#endif
-        "popq %%r14\n"
-        "popq %%r13\n"
-        "popq %%r12\n"
-        "popq %%rbx\n"
-        : "=&a"(ret)
-        : [dst] "r"(dst), [src] "r"(src), [src_len] "r"(src_len), [tmp] "r"(tmp)
-        : "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
-          "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory", "cc");
-    return ret;
-#else
-    (void)dst; (void)src; (void)src_len; (void)tmp;
-    return 0;
-#endif
+    return minlz_encode_block_2mb_inline_asm_sse2(dst, src, src_len, tmp);
 }
+
 #endif
 
 #endif
@@ -7865,260 +6983,104 @@ emit_remainder:
 }
 #endif
 
-static size_t minlz_encode_payload_fastest64k_ws(minlz_workspace *ws, uint8_t * restrict dst,
-                                                 size_t dst_cap,
-                                                 const uint8_t * restrict src, size_t src_len) {
-    unsigned table_bits;
-    size_t table_size;
-    int skip_log;
-    const int input_margin = 8;
-    int s_limit;
-    int dst_limit;
-    int next_emit = 0;
-    int s = 1;
-    int repeat = 1;
-    int d = 0;
-    uint64_t cv;
-    uint16_t *table;
-    uint8_t *table_buf;
-    const int check_repeats = MINLZ_FASTEST_CHECK_REPEATS;
-    int use_inline_probe = 0;
-    unsigned hash_shift = 0;
-
-    if (src_len <= MINLZ_MIN_NON_LITERAL_BLOCK_SIZE || src_len > 65536u) {
-        return 0;
-    }
-    if (src_len <= 1024u) {
-        table_bits = 9;
-        skip_log = 3;
-    } else if (src_len <= 4096u) {
-        table_bits = 10;
-        skip_log = 4;
-    } else if (src_len <= 16384u) {
-        table_bits = 13;
-        skip_log = 5;
-    } else {
-        table_bits = 12;
-        skip_log = 4;
-    }
-    table_size = (size_t)1u << table_bits;
-    (void)dst_cap;
-    if (minlz_workspace_prepare_encode_scratch(ws, 2, table_size * sizeof(table[0]),
-                                       &table_buf) != MINLZ_OK) {
-        return 0;
-    }
-    table = (uint16_t *)table_buf;
-    memset(table, 0, table_size * sizeof(table[0]));
-#if MINLZ_ENABLE_FASTEST64K_INLINE_PROBE && MINLZ_HAVE_INLINE_ASM_AMD64
-    use_inline_probe = minlz_backend_has_inline_asm_amd64();
-    hash_shift = (64u - table_bits) & 63u;
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+static MINLZ_ALWAYS_INLINE void minlz_clear_l1_table_avx2(uint8_t *p, size_t n) {
+    uint8_t *end = p + n;
+    __asm__ volatile(
+        "vpxor %%ymm0, %%ymm0, %%ymm0\n\t"
+        "1:\n\t"
+        "vmovdqu %%ymm0, 0(%[p])\n\t"
+        "vmovdqu %%ymm0, 32(%[p])\n\t"
+        "vmovdqu %%ymm0, 64(%[p])\n\t"
+        "vmovdqu %%ymm0, 96(%[p])\n\t"
+        "addq $128, %[p]\n\t"
+        "cmpq %[end], %[p]\n\t"
+        "jne 1b\n\t"
+        "vzeroupper"
+        : [p] "+r"(p)
+        : [end] "r"(end)
+        : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+          "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "cc", "memory");
+}
 #endif
-    s_limit = (int)src_len - input_margin;
-    dst_limit = (int)src_len - ((int)src_len >> 5) - 6;
-    cv = minlz_load64(src + s);
 
-    for (;;) {
-        int candidate = 0;
-        for (;;) {
-            int next_s = s + ((s - next_emit) >> skip_log) + 4;
-            uint32_t hash0;
-            uint32_t hash1;
-            uint32_t hash2;
-            int candidate2;
+#define MINLZ_FASTEST64K_IMPL minlz_encode_payload_fastest64k_impl_ws
+#define MINLZ_FASTEST64K_ENTRY uint16_t
+#define MINLZ_FASTEST64K_ENTRY_BYTES 2
+#include "block_encode_fastest64k.inc"
+#undef MINLZ_FASTEST64K_IMPL
+#undef MINLZ_FASTEST64K_ENTRY
+#undef MINLZ_FASTEST64K_ENTRY_BYTES
 
-            if (next_s > s_limit) {
-                goto emit_remainder;
-            }
-            if (MINLZ_LIKELY(use_inline_probe)) {
-                minlz_fastest64k_probe_inline_asm_amd64(
-                    table, cv, hash_shift, (uint16_t)s, &candidate, &candidate2, &hash2);
-            } else {
-                hash0 = minlz_hash5(cv, table_bits);
-                hash1 = minlz_hash5(cv >> 8, table_bits);
-                candidate = (int)table[hash0];
-                candidate2 = (int)table[hash1];
-                table[hash0] = (uint16_t)s;
-                table[hash1] = (uint16_t)(s + 1);
-                hash2 = minlz_hash5(cv >> 16, table_bits);
-            }
+#define MINLZ_FASTEST64K_IMPL minlz_encode_payload_fastest256_impl_ws
+#define MINLZ_FASTEST64K_ENTRY uint8_t
+#define MINLZ_FASTEST64K_ENTRY_BYTES 1
+#include "block_encode_fastest64k.inc"
+#undef MINLZ_FASTEST64K_IMPL
+#undef MINLZ_FASTEST64K_ENTRY
+#undef MINLZ_FASTEST64K_ENTRY_BYTES
 
-            if (check_repeats &&
-                (uint32_t)(cv >> 8) == minlz_load32(src + s - repeat + 1)) {
-                int base = s + 1;
-                int i = base - repeat;
-                size_t n;
-                while (base > next_emit && i > 0 && src[i - 1] == src[base - 1]) {
-                    i--;
-                    base--;
-                }
-                if (d + (base - next_emit) > dst_limit) {
-                    d = 0;
-                    goto done;
-                }
-                n = minlz_emit_literal_inline_fast(dst + d, src + next_emit,
-                                                   (size_t)(base - next_emit));
-                if (n == 0 && base != next_emit) {
-                    d = 0;
-                    goto done;
-                }
-                d += (int)n;
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+#define MINLZ_FASTEST64K_IMPL minlz_encode_payload_fastest4k_prefix_ws
+#define MINLZ_FASTEST64K_ENTRY uint16_t
+#define MINLZ_FASTEST64K_ENTRY_BYTES 2
+#define MINLZ_FASTEST64K_PREFIX_SSE2 1
+#include "block_encode_fastest64k.inc"
+#undef MINLZ_FASTEST64K_PREFIX_SSE2
+#undef MINLZ_FASTEST64K_IMPL
+#undef MINLZ_FASTEST64K_ENTRY
+#undef MINLZ_FASTEST64K_ENTRY_BYTES
+#endif
 
-                candidate = s - repeat + 5;
-                s += 5;
-                minlz_extend_match_int_fastest(src, &s, &candidate, (int)src_len);
-                n = minlz_emit_repeat_fast(dst + d, (size_t)(s - base));
-                if (n == 0) {
-                    d = 0;
-                    goto done;
-                }
-                d += (int)n;
-                next_emit = s;
-                if (s >= s_limit) {
-                    goto emit_remainder;
-                }
-                cv = minlz_load64(src + s);
-                continue;
-            }
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+#define MINLZ_FASTEST64K_IMPL minlz_encode_payload_fastest64k_large_asm_impl_ws
+#define MINLZ_FASTEST64K_ENTRY uint16_t
+#define MINLZ_FASTEST64K_ENTRY_BYTES 2
+#define MINLZ_FASTEST64K_FIXED_INLINE_PROBE 1
+#include "block_encode_fastest64k.inc"
+#undef MINLZ_FASTEST64K_FIXED_INLINE_PROBE
+#undef MINLZ_FASTEST64K_IMPL
+#undef MINLZ_FASTEST64K_ENTRY
+#undef MINLZ_FASTEST64K_ENTRY_BYTES
+#endif
 
-            if ((uint32_t)cv == minlz_load32(src + candidate)) {
-                break;
-            }
-            candidate = (int)table[hash2];
-            if ((uint32_t)(cv >> 8) == minlz_load32(src + candidate2)) {
-                table[hash2] = (uint16_t)(s + 2);
-                candidate = candidate2;
-                s++;
-                break;
-            }
-            table[hash2] = (uint16_t)(s + 2);
-            if ((uint32_t)(cv >> 16) == minlz_load32(src + candidate)) {
-                s += 2;
-                break;
-            }
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+static MINLZ_NOINLINE size_t minlz_encode_payload_fastest1k_ws(
+    minlz_workspace *ws, uint8_t * restrict dst, size_t dst_cap,
+    const uint8_t * restrict src, size_t src_len) {
+    return minlz_encode_payload_fastest64k_impl_ws(ws, dst, dst_cap, src, src_len, 9, 3);
+}
+#endif
 
-            cv = minlz_load64(src + next_s);
-            s = next_s;
-        }
-
-        while (candidate > 0 && s > next_emit && src[candidate - 1] == src[s - 1]) {
-            candidate--;
-            s--;
-        }
-
-        {
-            int base = s;
-            int length;
-            size_t n;
-            repeat = base - candidate;
-            s += 4;
-            candidate += 4;
-            minlz_extend_match_int_fastest(src, &s, &candidate, (int)src_len);
-            length = s - base;
-            if (next_emit != base) {
-                int lit_len = base - next_emit;
-                if (!MINLZ_FASTEST_FUSE_LITERALS ||
-                    lit_len > (int)MINLZ_MAX_COPY2_LITS ||
-                    repeat < (int)MINLZ_MIN_COPY2_OFFSET) {
-                    if (d + (base - next_emit) > dst_limit) {
-                        d = 0;
-                        goto done;
-                    }
-                    n = minlz_emit_literal_inline_fast(dst + d, src + next_emit, (size_t)lit_len);
-                    if (n == 0) {
-                        d = 0;
-                        goto done;
-                    }
-                    d += (int)n;
-                    n = minlz_emit_copy_fast(dst + d, (size_t)repeat, (size_t)length);
-                } else {
-                    n = minlz_emit_copy_lits2_inline_fast(dst + d, src + next_emit,
-                                                          (size_t)lit_len,
-                                                          (size_t)repeat, (size_t)length);
-                }
-            } else {
-                n = minlz_emit_copy_fast(dst + d, (size_t)repeat, (size_t)length);
-            }
-            if (n == 0) {
-                d = 0;
-                goto done;
-            }
-            d += (int)n;
-        }
-
-        for (;;) {
-            uint64_t x;
-            uint32_t m2_hash;
-            uint32_t curr_hash;
-            int immediate_candidate;
-            int base;
-            size_t n;
-
-            next_emit = s;
-            if (s >= s_limit) {
-                goto emit_remainder;
-            }
-            x = minlz_load64(src + s - 2);
-            if (d > dst_limit) {
-                d = 0;
-                goto done;
-            }
-            m2_hash = minlz_hash5(x, table_bits);
-            x >>= 16;
-            curr_hash = minlz_hash5(x, table_bits);
-            immediate_candidate = (int)table[curr_hash];
-            table[m2_hash] = (uint16_t)(s - 2);
-            table[curr_hash] = (uint16_t)s;
-            if ((uint32_t)x != minlz_load32(src + immediate_candidate)) {
-                cv = minlz_load64(src + s + 1);
-                s++;
-                break;
-            }
-            repeat = s - immediate_candidate;
-            base = s;
-            s += 4;
-            immediate_candidate += 4;
-            minlz_extend_match_int_fastest(
-                src, &s, &immediate_candidate, (int)src_len);
-            n = minlz_emit_copy_fast(dst + d, (size_t)repeat, (size_t)(s - base));
-            if (n == 0) {
-                d = 0;
-                goto done;
-            }
-            d += (int)n;
-        }
+static size_t minlz_encode_payload_fastest64k_ws(minlz_workspace *ws, uint8_t * restrict dst,
+    size_t dst_cap, const uint8_t * restrict src, size_t src_len) {
+    if (src_len <= 1024u) {
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+        return minlz_encode_payload_fastest1k_ws(ws, dst, dst_cap, src, src_len);
+#else
+        return minlz_encode_payload_fastest64k_impl_ws(ws, dst, dst_cap, src, src_len, 9, 3);
+#endif
     }
-
-emit_remainder:
-    if (next_emit < (int)src_len) {
-        size_t n;
-        if (d + ((int)src_len - next_emit) > dst_limit) {
-            d = 0;
-            goto done;
+    if (src_len <= 4096u) {
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+        if (_mm_movemask_epi8(_mm_cmpgt_epi8(
+                _mm_loadu_si128((const __m128i *)(const void *)src), _mm_set1_epi8(31))) == 0xffff) {
+            return minlz_encode_payload_fastest4k_prefix_ws(ws, dst, dst_cap, src, src_len, 10, 4);
         }
-        n = minlz_emit_literal_inline_fast(dst + d, src + next_emit,
-                                           src_len - (size_t)next_emit);
-        if (n == 0) {
-            d = 0;
-            goto done;
-        }
-        d += (int)n;
+#endif
+        return minlz_encode_payload_fastest64k_impl_ws(ws, dst, dst_cap, src, src_len, 10, 4);
     }
-    if (d >= (int)src_len) {
-        d = 0;
+    if (src_len <= 16384u) {
+        return minlz_encode_payload_fastest64k_impl_ws(ws, dst, dst_cap, src, src_len, 13, 5);
     }
-
-done:
-    return (size_t)d;
+    return minlz_encode_payload_fastest64k_impl_ws(ws, dst, dst_cap, src, src_len, 12, 4);
 }
 
-static size_t minlz_encode_payload_fastest_ws(minlz_workspace *ws, uint8_t * restrict dst,
-                                              size_t dst_cap,
-                                              const uint8_t * restrict src, size_t src_len) {
-    const unsigned table_bits = src_len > (2u << 20) ? 14u :
-        (src_len > (512u << 10) ? MINLZ_FASTEST_2MB_TABLE_BITS : 13u);
+static MINLZ_ALWAYS_INLINE size_t minlz_encode_payload_fastest_impl(
+    minlz_workspace *ws, uint8_t * restrict dst, size_t dst_cap,
+    const uint8_t * restrict src, size_t src_len, unsigned table_bits, int skip_log,
+    int check_offsets) {
     const size_t table_size = (size_t)1u << table_bits;
-    const int skip_log = src_len > (512u << 10) && src_len <= (2u << 20) ?
-        MINLZ_FASTEST_2MB_SKIP_LOG : 6;
     const int input_margin = 8;
     const int max_copy3_offset = (int)MINLZ_MAX_COPY3_OFFSET;
     int s_limit;
@@ -8194,7 +7156,7 @@ static size_t minlz_encode_payload_fastest_ws(minlz_workspace *ws, uint8_t * res
 
                 candidate = s - repeat + 5;
                 s += 5;
-                minlz_extend_match_int_fastest(src, &s, &candidate, (int)src_len);
+                minlz_extend_match_int_fastest_impl(src, &s, &candidate, (int)src_len, MINLZ_L1_MATCH_LONG);
                 n = minlz_emit_repeat_fast(dst + d, (size_t)(s - base));
                 if (n == 0) {
                     d = 0;
@@ -8209,18 +7171,18 @@ static size_t minlz_encode_payload_fastest_ws(minlz_workspace *ws, uint8_t * res
                 continue;
             }
 
-            if (candidate >= min_src_pos && (uint32_t)cv == minlz_load32(src + candidate)) {
+            if ((!check_offsets || candidate >= min_src_pos) && (uint32_t)cv == minlz_load32(src + candidate)) {
                 break;
             }
             candidate = (int)table[hash2];
-            if (candidate2 > min_src_pos && (uint32_t)(cv >> 8) == minlz_load32(src + candidate2)) {
+            if ((!check_offsets || candidate2 > min_src_pos) && (uint32_t)(cv >> 8) == minlz_load32(src + candidate2)) {
                 table[hash2] = (uint32_t)(s + 2);
                 candidate = candidate2;
                 s++;
                 break;
             }
             table[hash2] = (uint32_t)(s + 2);
-            if (candidate >= min_src_pos + 2 && (uint32_t)(cv >> 16) == minlz_load32(src + candidate)) {
+            if ((!check_offsets || candidate >= min_src_pos + 2) && (uint32_t)(cv >> 16) == minlz_load32(src + candidate)) {
                 s += 2;
                 break;
             }
@@ -8241,7 +7203,7 @@ static size_t minlz_encode_payload_fastest_ws(minlz_workspace *ws, uint8_t * res
             repeat = base - candidate;
             s += 4;
             candidate += 4;
-            minlz_extend_match_int_fastest(src, &s, &candidate, (int)src_len);
+            minlz_extend_match_int_fastest_impl(src, &s, &candidate, (int)src_len, MINLZ_L1_MATCH_LONG);
             length = s - base;
             if (next_emit != base) {
                 int lit_len = base - next_emit;
@@ -8299,7 +7261,7 @@ static size_t minlz_encode_payload_fastest_ws(minlz_workspace *ws, uint8_t * res
             immediate_candidate = (int)table[curr_hash];
             table[m2_hash] = (uint32_t)(s - 2);
             table[curr_hash] = (uint32_t)s;
-            if (s - immediate_candidate > max_copy3_offset ||
+            if ((check_offsets && s - immediate_candidate > max_copy3_offset) ||
                 (uint32_t)x !=
                     minlz_load32(src + immediate_candidate)) {
                 cv = minlz_load64(src + s + 1);
@@ -8310,8 +7272,8 @@ static size_t minlz_encode_payload_fastest_ws(minlz_workspace *ws, uint8_t * res
             base = s;
             s += 4;
             immediate_candidate += 4;
-            minlz_extend_match_int_fastest(
-                src, &s, &immediate_candidate, (int)src_len);
+            minlz_extend_match_int_fastest_impl(
+                src, &s, &immediate_candidate, (int)src_len, MINLZ_L1_MATCH_LONG);
             n = minlz_emit_copy_fast(dst + d, (size_t)repeat, (size_t)(s - base));
             if (n == 0) {
                 d = 0;
@@ -8341,6 +7303,22 @@ emit_remainder:
 
 done:
     return (size_t)d;
+}
+
+static size_t minlz_encode_payload_fastest_ws(minlz_workspace *ws, uint8_t * restrict dst,
+                                              size_t dst_cap,
+                                              const uint8_t * restrict src, size_t src_len) {
+    /* In the smaller buckets any previous position is in the COPY3 window. */
+    if (src_len > (2u << 20)) {
+        return minlz_encode_payload_fastest_impl(ws, dst, dst_cap, src, src_len, 14, 6, 1);
+    }
+#if MINLZ_FASTEST_2MB_TABLE_BITS != 13 || MINLZ_FASTEST_2MB_SKIP_LOG != 6
+    if (src_len > (512u << 10)) {
+        return minlz_encode_payload_fastest_impl(ws, dst, dst_cap, src, src_len,
+            MINLZ_FASTEST_2MB_TABLE_BITS, MINLZ_FASTEST_2MB_SKIP_LOG, 0);
+    }
+#endif
+    return minlz_encode_payload_fastest_impl(ws, dst, dst_cap, src, src_len, 13, 6, 0);
 }
 
 static size_t minlz_encode_fast_amd64_inline_ws(minlz_workspace *ws, uint8_t * restrict dst,
@@ -9282,15 +8260,9 @@ static MINLZ_ALWAYS_INLINE int minlz_periodic_equal_match32_asm(const uint8_t *a
 static MINLZ_ALWAYS_INLINE int minlz_periodic_equal_fast(const uint8_t *a,
                                                          const uint8_t *b,
                                                          size_t len) {
-    /*
-     * glibc selects its CPU-tuned equal-buffer path at runtime.  On the
-     * target amd64 CPUs it is consistently faster than the in-C AVX2
-     * reduction once the compared range reaches a MiB.  Keep this ahead of
-     * the custom candidates so the production path matches the focused gate.
-     */
-    if (len >= MINLZ_PERIODIC_EQUAL_MEMCMP_MIN &&
-        (minlz_backend_has_avx2() ||
-         (MINLZ_PERIODIC_EQUAL_LIBC_SSE42 && minlz_backend_has_sse42()))) {
+    /* Both ranges may be unaligned. Let libc select the implementation
+     * for large comparisons on the current CPU. */
+    if (len >= MINLZ_PERIODIC_EQUAL_MEMCMP_MIN) {
         return memcmp(a, b, len) == 0;
     }
 #if MINLZ_PERIODIC_EQUAL_AVX2_512
@@ -9518,6 +8490,7 @@ static size_t minlz_encode_payload_periodic_repeat_ws(minlz_workspace *ws,
         return 0;
     }
     first = minlz_load64(src);
+    const uint64_t last = minlz_load64(src + src_len - 8u);
     for (period = 1; period <= limit;) {
         size_t n;
         size_t m;
@@ -9529,11 +8502,11 @@ static size_t minlz_encode_payload_periodic_repeat_ws(minlz_workspace *ws,
         }
         period = (size_t)(hit - src);
 #endif
-        if (minlz_load64(src + period) != first) {
-            period++;
-            continue;
-        }
-        if (!minlz_periodic_equal_fast(src + period, src, src_len - period)) {
+        /* A near-periodic block can match at many offsets. Check its tail
+         * before comparing the entire block at each candidate offset. */
+        if (minlz_load64(src + period) != first ||
+            minlz_load64(src + src_len - period - 8u) != last ||
+            !minlz_periodic_equal_fast(src + period, src, src_len - period)) {
             period++;
             continue;
         }
@@ -9638,6 +8611,47 @@ static size_t minlz_encode_payload_superfast_ws(minlz_workspace *ws, uint8_t * r
     return minlz_encode_fast_amd64_inline_ws(ws, dst, dst_cap, src, src_len);
 }
 
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+/* This chooses a search implementation, never a raw/compressed wire format.
+ * Random binary input is cheaper to search once with C. Keep the C rescue
+ * after unsuccessful asm attempts for inputs whose matches the asm can miss. */
+static inline int minlz_l1_use_c_search(const uint8_t *src, size_t src_len) {
+    /* Preserve wide binary repetitions even when the sampled bytes look random. */
+    const __m128i first = _mm_loadu_si128((const __m128i *)(const void *)src);
+    const __m128i half = _mm_loadu_si128((const __m128i *)(const void *)(src + src_len / 2u));
+    if (_mm_movemask_epi8(_mm_cmpeq_epi8(first, half)) == 65535) {
+        return 0;
+    }
+    const size_t offsets[4] = {0u, src_len / 3u, (src_len * 2u) / 3u, src_len - 16u};
+    const __m128i zero = _mm_setzero_si128();
+    __m128i high = zero;
+    __m128i zeros = zero;
+    __m128i printable = zero;
+    size_t i;
+    for (i = 0; i < 4u; ++i) {
+        const __m128i bytes = _mm_loadu_si128((const __m128i *)(const void *)(src + offsets[i]));
+        high = _mm_add_epi64(high, _mm_sad_epu8(_mm_cmpgt_epi8(zero, bytes), zero));
+        zeros = _mm_add_epi64(zeros, _mm_sad_epu8(_mm_cmpeq_epi8(bytes, zero), zero));
+        if (src_len <= (16u << 10)) {
+            const __m128i ascii = _mm_and_si128(_mm_cmpgt_epi8(bytes, _mm_set1_epi8(31)),
+                                               _mm_cmpgt_epi8(_mm_set1_epi8(127), bytes));
+            printable = _mm_add_epi64(printable, _mm_sad_epu8(ascii, zero));
+        }
+    }
+    if (src_len <= (16u << 10)) {
+        const uint64_t text = (uint64_t)_mm_cvtsi128_si64(printable) +
+            (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(printable, 8));
+        const uint64_t nzero = (uint64_t)_mm_cvtsi128_si64(zeros) +
+            (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(zeros, 8));
+        return text < 48u * 255u && nzero < 16u * 255u;
+    }
+    return (uint64_t)_mm_cvtsi128_si64(high) +
+               (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(high, 8)) >= 24u * 255u &&
+           (uint64_t)_mm_cvtsi128_si64(zeros) +
+               (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(zeros, 8)) <= 2u * 255u;
+}
+#endif
+
 static size_t minlz_encode_fast_amd64_inline_ws(minlz_workspace *ws, uint8_t * restrict dst,
                                                 size_t dst_cap,
                                                 const uint8_t * restrict src, size_t src_len) {
@@ -9684,6 +8698,16 @@ static size_t minlz_encode_fast_amd64_inline_ws(minlz_workspace *ws, uint8_t * r
             return n;
         }
     }
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+    if (src_len > (4u << 10) && src_len <= (64u << 10) &&
+        minlz_backend_has_inline_asm_amd64() && minlz_l1_use_c_search(src, src_len)) {
+        if (src_len >= 32768u) {
+            return minlz_encode_payload_fastest64k_large_asm_impl_ws(
+                ws, dst, dst_cap, src, src_len, 12, 4);
+        }
+        return minlz_encode_payload_fastest64k_ws(ws, dst, dst_cap, src, src_len);
+    }
+#endif
 #if MINLZ_ENABLE_L1_2MB_INLINE_ACTIVE
     if (l1_2mb_goasm_candidate && scratch < 262144u) {
         scratch = 262144u;
@@ -9701,6 +8725,13 @@ static size_t minlz_encode_fast_amd64_inline_ws(minlz_workspace *ws, uint8_t * r
     if (src_len > (16u << 10) && src_len <= (64u << 10) && scratch < 16384u) {
         scratch = 16384u;
     }
+#endif
+#if !MINLZ_HAVE_INLINE_ASM_AMD64
+    /* Portable encoders prepare their own table; asm scratch is unnecessary. */
+    if (src_len <= 65536u) {
+        return minlz_encode_payload_fastest64k_ws(ws, dst, dst_cap, src, src_len);
+    }
+    return minlz_encode_payload_fastest_ws(ws, dst, dst_cap, src, src_len);
 #endif
     /*
      * This is the stable bucket switch point for the Go encodeBlockAsm*
@@ -11868,6 +10899,47 @@ static MINLZ_NOINLINE minlz_status minlz_encode_ws_nonraw(
 minlz_status minlz_encode_ws(minlz_workspace *ws, uint8_t *dst, size_t dst_cap,
                              size_t *dst_len, const uint8_t *src, size_t src_len,
                              int level) {
+    /* L1 returns raw blocks for inputs up to 32 bytes. Blocks up to 4 KiB
+     * with a workspace can enter the encoder without generic dispatch. */
+    if (level == MINLZ_LEVEL_FASTEST && src_len <= 4096u &&
+        dst && dst_len && (src || src_len == 0u)) {
+        if (src_len <= 32u) {
+            const size_t n = minlz_encode_uncompressed(dst, dst_cap, src, src_len);
+            *dst_len = n != 0u ? n : minlz_uncompressed_encoded_len(src_len);
+            return n != 0u ? MINLZ_OK : MINLZ_DST_TOO_SMALL;
+        }
+        if (ws && dst_cap >= src_len + 2u) {
+            size_t h;
+            size_t n;
+            *dst_len = 0;
+            dst[0] = 0;
+            /* The validated length fits in a one- or two-byte uvarint. */
+            if (src_len < 128u) {
+                dst[1] = (uint8_t)src_len;
+                h = 1u;
+            } else {
+                dst[1] = (uint8_t)(src_len | 0x80u);
+                dst[2] = (uint8_t)(src_len >> 7);
+                h = 2u;
+            }
+#if !(MINLZ_ENABLE_FASTEST64K_INLINE_PROBE && MINLZ_HAVE_INLINE_ASM_AMD64)
+            if (src_len <= 256u) {
+                n = minlz_encode_payload_fastest256_impl_ws(ws, dst + 1u + h,
+                    dst_cap - 1u - h, src, src_len, 9, 3);
+            } else
+#endif
+            {
+                n = minlz_encode_payload_fastest64k_ws(ws, dst + 1u + h,
+                                                      dst_cap - 1u - h, src, src_len);
+            }
+            if (n != 0u && 1u + h + n <= src_len + 2u) {
+                *dst_len = 1u + h + n;
+                return MINLZ_OK;
+            }
+            *dst_len = minlz_encode_uncompressed(dst, dst_cap, src, src_len);
+            return MINLZ_OK;
+        }
+    }
     if (dst_len && dst && src && minlz_valid_level(level) &&
         level != MINLZ_LEVEL_UNCOMPRESSED &&
         src_len > MINLZ_MIN_NON_LITERAL_BLOCK_SIZE &&

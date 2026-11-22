@@ -26,6 +26,9 @@
 
 static minlz_cpu_features g_features;
 static int g_features_ready;
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+static int g_sse41_shuffle;
+#endif
 static int g_backend_ready;
 static minlz_backend g_backend;
 #if MINLZ_HAVE_INLINE_ASM_AMD64
@@ -81,6 +84,11 @@ const minlz_cpu_features *minlz_cpu_features_get(void) {
             if (max_leaf >= 1) {
                 minlz_cpuid(1, 0, r1);
                 f.x86 = 1;
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+                const unsigned sse41_and_ssse3 = (1u << 19) | (1u << 9);
+                __atomic_store_n(&g_sse41_shuffle, ((unsigned)r1[2] & sse41_and_ssse3) == sse41_and_ssse3,
+                                 __ATOMIC_RELAXED);
+#endif
                 f.sse42 = (r1[2] & (1 << 20)) != 0;
                 f.pclmul = (r1[2] & (1 << 1)) != 0;
                 f.avx = (r1[2] & (1 << 28)) != 0;
@@ -203,6 +211,13 @@ minlz_backend minlz_select_backend(void) {
     }
     return g_backend;
 }
+
+#if MINLZ_HAVE_INLINE_ASM_AMD64
+int minlz_backend_has_sse41_shuffle(void) {
+    return minlz_select_backend() != MINLZ_BACKEND_PORTABLE &&
+           __atomic_load_n(&g_sse41_shuffle, __ATOMIC_RELAXED);
+}
+#endif
 
 int minlz_backend_has_sse42(void) {
     minlz_backend b = minlz_select_backend();

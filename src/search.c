@@ -1676,6 +1676,11 @@ typedef struct minlz_search_window_record {
     uint32_t hash;
 } minlz_search_window_record;
 
+typedef struct minlz_forward_match {
+    int64_t block_start;
+    int64_t stream_offset;
+} minlz_forward_match;
+
 struct minlz_block_searcher {
     minlz_read_cb read_cb;
     void *read_ctx;
@@ -1696,7 +1701,9 @@ struct minlz_block_searcher {
     size_t forward_context_len;
     size_t forward_context_cap;
     int64_t forward_context_start;
-    int64_t forward_context_offset;
+    minlz_forward_match *forward_matches;
+    size_t forward_count;
+    size_t forward_matches_cap;
     uint8_t *lazy_payload;
     size_t lazy_payload_len;
     size_t lazy_payload_cap;
@@ -2121,31 +2128,6 @@ static minlz_status minlz_searcher_read_payload(
                             searcher->payload, len, 0, NULL);
 }
 
-static minlz_status minlz_search_read_u64varint(
-    const uint8_t *src, size_t src_len, uint64_t *value, size_t *used) {
-    uint64_t result = 0;
-    unsigned shift = 0;
-    size_t i;
-    if (!value || !used) {
-        return MINLZ_CORRUPT;
-    }
-    for (i = 0; i < src_len && i < 10u; i++) {
-        uint8_t byte = src[i];
-        if (byte < 0x80u) {
-            if (i == 9u && byte > 1u) {
-                return MINLZ_CORRUPT;
-            }
-            result |= (uint64_t)byte << shift;
-            *value = result;
-            *used = i + 1u;
-            return MINLZ_OK;
-        }
-        result |= (uint64_t)(byte & 0x7fu) << shift;
-        shift += 7u;
-    }
-    return MINLZ_CORRUPT;
-}
-
 static minlz_status minlz_searcher_data_len(
     uint8_t chunk_type, const uint8_t *payload, size_t payload_len,
     size_t max_block, size_t *decoded_len) {
@@ -2369,49 +2351,127 @@ static minlz_status minlz_searcher_update_boundary_tail(
     return MINLZ_OK;
 }
 
-static minlz_status minlz_searcher_set_forward_context(
+static minlz_status minlz_searcher_queue_forward(
     minlz_block_searcher *searcher,
+    const uint8_t *previous, size_t previous_len,
     const uint8_t *block, size_t block_len,
-    int64_t block_start, int64_t match_offset) {
-    minlz_status st = minlz_searcher_reserve(
-        &searcher->forward_context,
-        &searcher->forward_context_cap,
-        block_len ? block_len : 1u);
+    int64_t block_start, int64_t stream_offset) {
+    uint8_t *entries = (uint8_t *)searcher->forward_matches;
+    minlz_status st;
+
+    if (searcher->forward_count >= SIZE_MAX / sizeof(minlz_forward_match)) {
+        return MINLZ_TOO_LARGE;
+    }
+    st = minlz_searcher_reserve(
+        &entries, &searcher->forward_matches_cap,
+        (searcher->forward_count + 1u) * sizeof(minlz_forward_match));
     if (st != MINLZ_OK) {
         return st;
     }
-    if (block_len != 0u) {
-        memcpy(searcher->forward_context, block, block_len);
+    searcher->forward_matches = (minlz_forward_match *)entries;
+
+    /* All pending ranges end at the same block. Keep one copy of their
+     * bytes, including the prefix of a match that straddles a boundary. */
+    if (searcher->forward_count == 0u) {
+        if (previous_len > SIZE_MAX - block_len) {
+            return MINLZ_TOO_LARGE;
+        }
+        st = minlz_searcher_reserve(&searcher->forward_context,
+                                    &searcher->forward_context_cap,
+                                    previous_len + block_len);
+        if (st != MINLZ_OK) {
+            return st;
+        }
+        if (previous_len != 0u) {
+            memcpy(searcher->forward_context, previous, previous_len);
+        }
+        if (block_len != 0u) {
+            memcpy(searcher->forward_context + previous_len, block, block_len);
+        }
+        searcher->forward_context_len = previous_len + block_len;
+        searcher->forward_context_start = block_start;
+    } else if (block_start < searcher->forward_context_start) {
+        size_t prefix = (size_t)(searcher->forward_context_start - block_start);
+        if (prefix > previous_len) {
+            return MINLZ_CORRUPT;
+        }
+        if (prefix > SIZE_MAX - searcher->forward_context_len) {
+            return MINLZ_TOO_LARGE;
+        }
+        st = minlz_searcher_reserve(&searcher->forward_context,
+                                    &searcher->forward_context_cap,
+                                    prefix + searcher->forward_context_len);
+        if (st != MINLZ_OK) {
+            return st;
+        }
+        memmove(searcher->forward_context + prefix, searcher->forward_context,
+                searcher->forward_context_len);
+        memcpy(searcher->forward_context, previous, prefix);
+        searcher->forward_context_len += prefix;
+        searcher->forward_context_start = block_start;
     }
-    searcher->forward_context_len = block_len;
-    searcher->forward_context_start = block_start;
-    searcher->forward_context_offset = match_offset;
+    searcher->forward_matches[searcher->forward_count++] =
+        (minlz_forward_match){block_start, stream_offset};
     return MINLZ_OK;
 }
 
-static minlz_status minlz_searcher_forward_eof(
-    minlz_search_match_cb callback, void *callback_ctx,
-    const uint8_t *match_block, size_t match_block_len,
-    int64_t block_start, int64_t stream_offset) {
-    minlz_search_result result;
+static minlz_status minlz_searcher_dispatch_forward(
+    minlz_block_searcher *searcher, const uint8_t *next, size_t next_len,
+    minlz_search_match_cb callback, void *callback_ctx) {
+    size_t i, kept = 0u, drop, len;
+    int64_t start = INT64_MAX;
     minlz_status st;
-    if (!callback) {
+
+    if (searcher->forward_count == 0u) {
         return MINLZ_OK;
     }
-    memset(&result, 0, sizeof(result));
-    result.previous_block = match_block;
-    result.previous_block_len = match_block_len;
-    result.block = NULL;
-    result.block_len = 0u;
-    result.offset = stream_offset - block_start;
-    result.stream_offset = stream_offset;
-    result.block_start = block_start;
-    st = callback(callback_ctx, &result);
-    /*
-     * A second forward request at EOF has nowhere else to go. Go drops the
-     * deferred request after re-dispatching with a nil next block.
-     */
-    return st == MINLZ_SEARCH_FORWARD ? MINLZ_OK : st;
+    for (i = 0u; i < searcher->forward_count; i++) {
+        minlz_forward_match m = searcher->forward_matches[i];
+        const size_t offset = (size_t)(m.block_start - searcher->forward_context_start);
+        minlz_search_result result = {0};
+        result.previous_block = searcher->forward_context + offset;
+        result.previous_block_len = searcher->forward_context_len - offset;
+        result.block = next;
+        result.block_len = next_len;
+        result.offset = m.stream_offset - m.block_start;
+        result.stream_offset = m.stream_offset;
+        result.block_start = m.block_start;
+        st = callback(callback_ctx, &result);
+        if (st == MINLZ_SEARCH_FORWARD) {
+            if (next) {
+                searcher->forward_matches[kept++] = m;
+                if (m.block_start < start) {
+                    start = m.block_start;
+                }
+            }
+        } else if (st != MINLZ_OK) {
+            return st;
+        }
+    }
+    searcher->forward_count = kept;
+    if (kept == 0u) {
+        searcher->forward_context_len = 0u;
+        return MINLZ_OK;
+    }
+    drop = (size_t)(start - searcher->forward_context_start);
+    len = searcher->forward_context_len - drop;
+    if (next_len > SIZE_MAX - len) {
+        return MINLZ_TOO_LARGE;
+    }
+    st = minlz_searcher_reserve(&searcher->forward_context,
+                                &searcher->forward_context_cap, len + next_len);
+    if (st != MINLZ_OK) {
+        return st;
+    }
+    if (drop != 0u) {
+        memmove(searcher->forward_context, searcher->forward_context + drop, len);
+    }
+    if (next_len != 0u) {
+        memcpy(searcher->forward_context + len, next, next_len);
+    }
+    searcher->forward_context_len = len + next_len;
+    searcher->forward_context_start = start;
+    return MINLZ_OK;
 }
 
 static minlz_status minlz_searcher_scan_block(
@@ -2420,8 +2480,7 @@ static minlz_status minlz_searcher_scan_block(
     const uint8_t *block, size_t block_len,
     int64_t current_start,
     minlz_search_match_cb callback, void *callback_ctx,
-    uint64_t *matches_found,
-    int *forward_requested, int64_t *forward_offset) {
+    uint64_t *matches_found) {
     size_t tail_len = searcher->boundary_tail_len;
     size_t i;
     minlz_status st;
@@ -2479,15 +2538,11 @@ static minlz_status minlz_searcher_scan_block(
                 context, context_len, block, block_len,
                 context_start, stream_offset, result_offset);
             if (st == MINLZ_SEARCH_FORWARD) {
-                st = minlz_searcher_set_forward_context(
-                    searcher, context, context_len,
-                    context_start, result_offset);
-                if (st != MINLZ_OK) {
-                    return st;
-                }
-                *forward_requested = 1;
-                *forward_offset = stream_offset;
-            } else if (st != MINLZ_OK) {
+                st = minlz_searcher_queue_forward(
+                    searcher, context, context_len, block, block_len,
+                    context_start, stream_offset);
+            }
+            if (st != MINLZ_OK) {
                 return st;
             }
         }
@@ -2510,15 +2565,11 @@ static minlz_status minlz_searcher_scan_block(
                     : current_start,
                 current_start + (int64_t)i, offset);
             if (st == MINLZ_SEARCH_FORWARD) {
-                st = minlz_searcher_set_forward_context(
-                    searcher, block, block_len,
-                    current_start, (int64_t)i);
-                if (st != MINLZ_OK) {
-                    return st;
-                }
-                *forward_requested = 1;
-                *forward_offset = current_start + (int64_t)i;
-            } else if (st != MINLZ_OK) {
+                st = minlz_searcher_queue_forward(
+                    searcher, NULL, 0u, block, block_len,
+                    current_start, current_start + (int64_t)i);
+            }
+            if (st != MINLZ_OK) {
                 return st;
             }
         }
@@ -2564,8 +2615,6 @@ static minlz_status minlz_searcher_rescue_tail(
     uint8_t *decoded = NULL;
     size_t decoded_len = 0;
     uint64_t found = 0;
-    int forward_requested = 0;
-    int64_t forward_offset = 0;
     minlz_status st;
 
     if (!searcher->tail_rescue) {
@@ -2620,19 +2669,9 @@ static minlz_status minlz_searcher_rescue_tail(
     st = minlz_searcher_scan_block(
         searcher, pattern, pattern_len,
         decoded, decoded_len, searcher->tail_start,
-        callback, callback_ctx, &found,
-        &forward_requested, &forward_offset);
+        callback, callback_ctx, &found);
     if (st != MINLZ_OK) {
         return st;
-    }
-    if (forward_requested) {
-        st = minlz_searcher_forward_eof(
-            callback, callback_ctx,
-            decoded, decoded_len,
-            searcher->tail_start, forward_offset);
-        if (st != MINLZ_OK) {
-            return st;
-        }
     }
     if (found == 0u) {
         searcher->stats.blocks_false_positive++;
@@ -2676,6 +2715,7 @@ void minlz_block_searcher_destroy(minlz_block_searcher *searcher) {
     free(searcher->boundary_tail);
     free(searcher->boundary_join);
     free(searcher->forward_context);
+    free(searcher->forward_matches);
     free(searcher->lazy_payload);
     free(searcher->tail_payload);
     free(searcher->windows);
@@ -2996,8 +3036,6 @@ minlz_status minlz_block_searcher_search(
     int pending_usable = 0;
     int pending_possible = 1;
     int pending_tail_only = 0;
-    int forward_active = 0;
-    int64_t forward_stream_offset = 0;
     int64_t current_start = 0;
     uint64_t stream_total = 0;
     minlz_status st = MINLZ_OK;
@@ -3009,7 +3047,7 @@ minlz_status minlz_block_searcher_search(
     memset(&searcher->stats, 0, sizeof(searcher->stats));
     searcher->previous_len = 0;
     minlz_searcher_clear_boundary_tail(searcher);
-    searcher->forward_context_len = 0u;
+    searcher->forward_count = 0u;
     minlz_searcher_clear_lazy(searcher);
     searcher->tail_rescue = 0;
     searcher->window_count = 0u;
@@ -3030,27 +3068,11 @@ minlz_status minlz_block_searcher_search(
             st = minlz_searcher_rescue_tail(
                 searcher, pattern, pattern_len,
                 callback, callback_ctx);
-            if (st == MINLZ_SEARCH_STOP) {
-                return MINLZ_OK;
+            if (st == MINLZ_OK) {
+                st = minlz_searcher_dispatch_forward(
+                    searcher, NULL, 0u, callback, callback_ctx);
             }
-            if (st != MINLZ_OK) {
-                return st;
-            }
-            if (forward_active) {
-                st = minlz_searcher_forward_eof(
-                    callback, callback_ctx,
-                    searcher->forward_context,
-                    searcher->forward_context_len,
-                    searcher->forward_context_start,
-                    forward_stream_offset);
-                if (st == MINLZ_SEARCH_STOP) {
-                    return MINLZ_OK;
-                }
-                if (st != MINLZ_OK) {
-                    return st;
-                }
-            }
-            return MINLZ_OK;
+            return st == MINLZ_SEARCH_STOP ? MINLZ_OK : st;
         }
         chunk_type = header[0];
         chunk_len = (size_t)header[1] |
@@ -3086,11 +3108,10 @@ minlz_status minlz_block_searcher_search(
             stream_total = 0;
             searcher->previous_len = 0;
             minlz_searcher_clear_boundary_tail(searcher);
-            searcher->forward_context_len = 0u;
             minlz_searcher_clear_lazy(searcher);
             continue;
         }
-        if (!have_header) {
+        if (!have_header && chunk_type != MINLZ_CHUNK_EOF) {
             if (chunk_type <= MINLZ_MAX_NON_SKIPPABLE_CHUNK ||
                 (chunk_type >= 0xc0u &&
                  chunk_type <= MINLZ_MAX_USER_NON_SKIPPABLE_CHUNK)) {
@@ -3233,7 +3254,7 @@ minlz_status minlz_block_searcher_search(
                 return st;
             }
             if (chunk_len != 0u) {
-                st = minlz_search_read_u64varint(
+                st = minlz_read_uvarint64(
                     searcher->payload, chunk_len, &expected, &used);
                 if (st != MINLZ_OK || used != chunk_len ||
                     expected != stream_total) {
@@ -3243,36 +3264,25 @@ minlz_status minlz_block_searcher_search(
             st = minlz_searcher_rescue_tail(
                 searcher, pattern, pattern_len,
                 callback, callback_ctx);
+            if (st == MINLZ_OK) {
+                st = minlz_searcher_dispatch_forward(
+                    searcher, NULL, 0u, callback, callback_ctx);
+            }
             if (st == MINLZ_SEARCH_STOP) {
                 return MINLZ_OK;
             }
             if (st != MINLZ_OK) {
                 return st;
             }
-            if (forward_active) {
-                st = minlz_searcher_forward_eof(
-                    callback, callback_ctx,
-                    searcher->forward_context,
-                    searcher->forward_context_len,
-                    searcher->forward_context_start,
-                    forward_stream_offset);
-                if (st == MINLZ_SEARCH_STOP) {
-                    return MINLZ_OK;
-                }
-                if (st != MINLZ_OK) {
-                    return st;
-                }
-            }
             have_header = 0;
+            stream_total = 0;
             pending_seen = 0;
             pending_usable = 0;
             pending_possible = 1;
             pending_tail_only = 0;
             searcher->previous_len = 0;
             minlz_searcher_clear_boundary_tail(searcher);
-            searcher->forward_context_len = 0u;
             minlz_searcher_clear_lazy(searcher);
-            forward_active = 0;
             continue;
         }
 
@@ -3284,8 +3294,6 @@ minlz_status minlz_block_searcher_search(
             int skip;
             int need_boundary;
             uint64_t found = 0;
-            int forward_requested = 0;
-            int64_t next_forward_offset = 0;
             minlz_search_lazy_callback lazy_callback;
             minlz_search_match_cb scan_callback = callback;
             void *scan_callback_ctx = callback_ctx;
@@ -3318,7 +3326,7 @@ minlz_status minlz_block_searcher_search(
             need_boundary = skip &&
                             searcher->boundary_tail_len != 0u &&
                             pattern_len > 1u;
-            if (skip && !need_boundary && !forward_active) {
+            if (skip && !need_boundary && searcher->forward_count == 0u) {
                 if (pending_tail_only) {
                     st = minlz_searcher_hold_tail(
                         searcher, chunk_type, chunk_len,
@@ -3359,40 +3367,10 @@ minlz_status minlz_block_searcher_search(
                 searcher->stats.blocks_boundary_scanned++;
             }
 
-            if (forward_active && callback) {
-                minlz_search_result result;
-                minlz_status callback_st;
-                memset(&result, 0, sizeof(result));
-                result.previous_block =
-                    searcher->forward_context_len
-                        ? searcher->forward_context
-                        : NULL;
-                result.previous_block_len =
-                    searcher->forward_context_len;
-                result.block = decoded;
-                result.block_len = decoded_len;
-                result.offset =
-                    searcher->forward_context_offset;
-                result.stream_offset = forward_stream_offset;
-                result.block_start =
-                    searcher->forward_context_start;
-                callback_st = callback(callback_ctx, &result);
-                if (callback_st == MINLZ_SEARCH_STOP) {
-                    return MINLZ_OK;
-                }
-                if (callback_st == MINLZ_SEARCH_FORWARD) {
-                    st = minlz_searcher_set_forward_context(
-                        searcher, decoded, decoded_len,
-                        searcher->forward_context_start,
-                        searcher->forward_context_offset);
-                    if (st != MINLZ_OK) {
-                        return st;
-                    }
-                    forward_requested = 1;
-                    next_forward_offset = forward_stream_offset;
-                } else if (callback_st != MINLZ_OK) {
-                    return callback_st;
-                }
+            st = minlz_searcher_dispatch_forward(
+                searcher, decoded, decoded_len, callback, callback_ctx);
+            if (st != MINLZ_OK) {
+                return st == MINLZ_SEARCH_STOP ? MINLZ_OK : st;
             }
 
             if (searcher->lazy_valid && callback) {
@@ -3411,8 +3389,7 @@ minlz_status minlz_block_searcher_search(
             st = minlz_searcher_scan_block(
                 searcher, pattern, pattern_len,
                 decoded, decoded_len, current_start,
-                scan_callback, scan_callback_ctx, &found,
-                &forward_requested, &next_forward_offset);
+                scan_callback, scan_callback_ctx, &found);
             if (st == MINLZ_SEARCH_STOP) {
                 return MINLZ_OK;
             }
@@ -3435,12 +3412,6 @@ minlz_status minlz_block_searcher_search(
             minlz_searcher_clear_lazy(searcher);
             current_start += (int64_t)decoded_len;
             stream_total += decoded_len;
-            forward_active = forward_requested;
-            if (forward_requested) {
-                forward_stream_offset = next_forward_offset;
-            } else {
-                searcher->forward_context_len = 0u;
-            }
             pending_seen = 0;
             pending_usable = 0;
             pending_possible = 1;
@@ -3861,7 +3832,7 @@ minlz_status minlz_build_sidecar(
                 goto done;
             }
             if (chunk_len != 0u) {
-                st = minlz_search_read_u64varint(
+                st = minlz_read_uvarint64(
                     payload, chunk_len, &expected, &used);
                 if (st != MINLZ_OK || used != chunk_len ||
                     expected != total) {
@@ -4174,8 +4145,6 @@ struct minlz_sidecar_searcher {
     size_t tail_wire_len;
     int64_t tail_start;
     int tail_rescue;
-    int forward_active;
-    int64_t forward_stream_offset;
 };
 
 #define MINLZ_SIDECAR_READ_AHEAD_MIN (64u << 10)
@@ -4494,6 +4463,7 @@ void minlz_sidecar_searcher_destroy(
     free(searcher->scan.boundary_tail);
     free(searcher->scan.boundary_join);
     free(searcher->scan.forward_context);
+    free(searcher->scan.forward_matches);
     free(searcher->scan.windows);
     free(searcher->main_payload);
     free(searcher->read_ahead);
@@ -4585,8 +4555,6 @@ static minlz_status minlz_sidecar_process_ref(
         skip && searcher->scan.boundary_tail_len != 0u &&
         pattern_len > 1u;
     uint64_t found = 0;
-    int forward_requested = 0;
-    int64_t forward_offset = 0;
     minlz_search_lazy_callback lazy_callback;
     minlz_search_match_cb scan_callback = callback;
     void *scan_callback_ctx = callback_ctx;
@@ -4601,7 +4569,7 @@ static minlz_status minlz_sidecar_process_ref(
         searcher->scan.bail_on_missing) {
         return MINLZ_SEARCH_TABLES_UNUSABLE;
     }
-    if (skip && !need_boundary && !searcher->forward_active) {
+    if (skip && !need_boundary && searcher->scan.forward_count == 0u) {
         st = minlz_sidecar_main_header(
             searcher, offset, &chunk_type, &chunk_len);
         if (st != MINLZ_OK) {
@@ -4644,44 +4612,11 @@ static minlz_status minlz_sidecar_process_ref(
     if (need_boundary) {
         searcher->scan.stats.blocks_boundary_scanned++;
     }
-    if (searcher->forward_active && callback) {
-        minlz_search_result result;
-        minlz_status callback_st;
-        memset(&result, 0, sizeof(result));
-        result.previous_block =
-            searcher->scan.forward_context_len
-                ? searcher->scan.forward_context
-                : NULL;
-        result.previous_block_len =
-            searcher->scan.forward_context_len;
-        result.block = decoded;
-        result.block_len = got_len;
-        result.offset =
-            searcher->scan.forward_context_offset;
-        result.stream_offset =
-            searcher->forward_stream_offset;
-        result.block_start =
-            searcher->scan.forward_context_start;
-        callback_st = callback(callback_ctx, &result);
-        if (callback_st == MINLZ_SEARCH_STOP) {
-            return MINLZ_SEARCH_STOP;
-        }
-        if (callback_st == MINLZ_SEARCH_FORWARD) {
-            st = minlz_searcher_set_forward_context(
-                &searcher->scan, decoded, got_len,
-                searcher->scan.forward_context_start,
-                searcher->scan.forward_context_offset);
-            if (st != MINLZ_OK) {
-                return st;
-            }
-            forward_requested = 1;
-            forward_offset =
-                searcher->forward_stream_offset;
-        } else if (callback_st != MINLZ_OK) {
-            return callback_st;
-        }
+    st = minlz_searcher_dispatch_forward(
+        &searcher->scan, decoded, got_len, callback, callback_ctx);
+    if (st != MINLZ_OK) {
+        return st;
     }
-    searcher->forward_active = 0;
     if (searcher->lazy_valid && callback) {
         lazy_callback.callback = callback;
         lazy_callback.callback_ctx = callback_ctx;
@@ -4698,12 +4633,8 @@ static minlz_status minlz_sidecar_process_ref(
     st = minlz_searcher_scan_block(
         &searcher->scan, pattern, pattern_len,
         decoded, got_len, *current_start,
-        scan_callback, scan_callback_ctx, &found,
-        &forward_requested, &forward_offset);
-    if (st == MINLZ_SEARCH_STOP) {
-        return MINLZ_SEARCH_STOP;
-    }
-    if (st != MINLZ_OK && st != MINLZ_SEARCH_FORWARD) {
+        scan_callback, scan_callback_ctx, &found);
+    if (st != MINLZ_OK) {
         return st;
     }
     if (table_usable && table_possible && found == 0u) {
@@ -4721,12 +4652,6 @@ static minlz_status minlz_sidecar_process_ref(
     searcher->scan.previous_start = *current_start;
     minlz_sidecar_clear_lazy(searcher);
     *current_start += (int64_t)got_len;
-    searcher->forward_active = forward_requested;
-    if (forward_requested) {
-        searcher->forward_stream_offset = forward_offset;
-    } else {
-        searcher->scan.forward_context_len = 0u;
-    }
     (void)wire_len;
     return MINLZ_OK;
 }
@@ -4739,8 +4664,6 @@ static minlz_status minlz_sidecar_rescue_tail(
     size_t decoded_len = 0;
     size_t wire_len = 0;
     uint64_t found = 0;
-    int forward_requested = 0;
-    int64_t forward_offset = 0;
     minlz_status st;
 
     if (!searcher->tail_rescue) {
@@ -4773,19 +4696,9 @@ static minlz_status minlz_sidecar_rescue_tail(
     st = minlz_searcher_scan_block(
         &searcher->scan, pattern, pattern_len,
         decoded, decoded_len, searcher->tail_start,
-        callback, callback_ctx, &found,
-        &forward_requested, &forward_offset);
+        callback, callback_ctx, &found);
     if (st != MINLZ_OK) {
         return st;
-    }
-    if (forward_requested) {
-        st = minlz_searcher_forward_eof(
-            callback, callback_ctx,
-            decoded, decoded_len,
-            searcher->tail_start, forward_offset);
-        if (st != MINLZ_OK) {
-            return st;
-        }
     }
     if (found == 0u) {
         searcher->scan.stats.blocks_false_positive++;
@@ -4814,9 +4727,8 @@ minlz_status minlz_sidecar_searcher_search(
     memset(&searcher->scan.stats, 0, sizeof(searcher->scan.stats));
     searcher->scan.previous_len = 0;
     minlz_searcher_clear_boundary_tail(&searcher->scan);
-    searcher->scan.forward_context_len = 0u;
+    searcher->scan.forward_count = 0u;
     searcher->tail_rescue = 0;
-    searcher->forward_active = 0;
     minlz_sidecar_clear_lazy(searcher);
     searcher->scan.window_count = 0u;
     searcher->scan.tables_tallied = 0u;
@@ -4853,36 +4765,18 @@ minlz_status minlz_sidecar_searcher_search(
             return st;
         }
         if (got == 0u) {
-            st = minlz_sidecar_rescue_tail(
-                searcher, pattern, pattern_len,
-                callback, callback_ctx);
-            if (st == MINLZ_SEARCH_STOP) {
-                return MINLZ_OK;
-            }
-            if (st != MINLZ_OK) {
-                return st;
-            }
-            if (searcher->forward_active) {
-                st = minlz_searcher_forward_eof(
-                    callback, callback_ctx,
-                    searcher->scan.forward_context,
-                    searcher->scan.forward_context_len,
-                    searcher->scan.forward_context_start,
-                    searcher->forward_stream_offset);
-                if (st == MINLZ_SEARCH_STOP) {
-                    return MINLZ_OK;
-                }
-                if (st != MINLZ_OK) {
-                    return st;
-                }
-                searcher->forward_active = 0;
-            }
-            return MINLZ_OK;
+            return stream_open ? MINLZ_CORRUPT : MINLZ_OK;
         }
         chunk_type = header[0];
         chunk_len = (size_t)header[1] |
                     ((size_t)header[2] << 8) |
                     ((size_t)header[3] << 16);
+        if (!stream_open && chunk_type != MINLZ_CHUNK_STREAM_ID &&
+            (chunk_type <= MINLZ_MAX_NON_SKIPPABLE_CHUNK ||
+             (chunk_type >= MINLZ_CHUNK_SEARCH_INFO &&
+              chunk_type <= MINLZ_CHUNK_REMOTE_BLOCK_REF))) {
+            return MINLZ_CORRUPT;
+        }
         st = minlz_searcher_read_payload(
             &searcher->scan, chunk_len);
         if (st != MINLZ_OK) {
@@ -4912,7 +4806,6 @@ minlz_status minlz_sidecar_searcher_search(
             table_tail_only = 0;
             searcher->scan.previous_len = 0;
             minlz_searcher_clear_boundary_tail(&searcher->scan);
-            searcher->scan.forward_context_len = 0u;
             minlz_sidecar_clear_lazy(searcher);
             stream_open = 1;
             continue;
@@ -5044,14 +4937,14 @@ minlz_status minlz_sidecar_searcher_search(
                 size_t used1 = 0;
                 size_t used2 = 0;
                 size_t actual;
-                st = minlz_search_read_u64varint(
+                st = minlz_read_uvarint64(
                     payload, remaining, &encoded_offset, &used1);
                 if (st != MINLZ_OK) {
                     return st;
                 }
                 payload += used1;
                 remaining -= used1;
-                st = minlz_search_read_u64varint(
+                st = minlz_read_uvarint64(
                     payload, remaining, &minus_actual, &used2);
                 if (st != MINLZ_OK) {
                     return st;
@@ -5102,11 +4995,8 @@ minlz_status minlz_sidecar_searcher_search(
         if (chunk_type == MINLZ_CHUNK_EOF) {
             uint64_t size = 0;
             size_t used = 0;
-            if (!stream_open) {
-                return MINLZ_CORRUPT;
-            }
             if (chunk_len != 0u) {
-                st = minlz_search_read_u64varint(
+                st = minlz_read_uvarint64(
                     searcher->scan.payload, chunk_len,
                     &size, &used);
                 if (st != MINLZ_OK || used != chunk_len ||
@@ -5117,26 +5007,15 @@ minlz_status minlz_sidecar_searcher_search(
             st = minlz_sidecar_rescue_tail(
                 searcher, pattern, pattern_len,
                 callback, callback_ctx);
+            if (st == MINLZ_OK) {
+                st = minlz_searcher_dispatch_forward(
+                    &searcher->scan, NULL, 0u, callback, callback_ctx);
+            }
             if (st == MINLZ_SEARCH_STOP) {
                 return MINLZ_OK;
             }
             if (st != MINLZ_OK) {
                 return st;
-            }
-            if (searcher->forward_active) {
-                st = minlz_searcher_forward_eof(
-                    callback, callback_ctx,
-                    searcher->scan.forward_context,
-                    searcher->scan.forward_context_len,
-                    searcher->scan.forward_context_start,
-                    searcher->forward_stream_offset);
-                if (st == MINLZ_SEARCH_STOP) {
-                    return MINLZ_OK;
-                }
-                if (st != MINLZ_OK) {
-                    return st;
-                }
-                searcher->forward_active = 0;
             }
             current_start = 0;
             table_seen = 0;
@@ -5145,7 +5024,6 @@ minlz_status minlz_sidecar_searcher_search(
             table_tail_only = 0;
             searcher->scan.previous_len = 0;
             minlz_searcher_clear_boundary_tail(&searcher->scan);
-            searcher->scan.forward_context_len = 0u;
             minlz_sidecar_clear_lazy(searcher);
             stream_open = 0;
             continue;

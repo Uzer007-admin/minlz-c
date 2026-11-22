@@ -484,21 +484,22 @@ minlz_status minlz_stream_decode_ws(minlz_workspace *ws,
                 goto decode_done;
             }
             if (chunk_len != 0) {
-                size_t want = 0;
+                uint64_t want = 0;
                 size_t used = 0;
                 st = minlz_read_exact(
                     read_cb, read_ctx, eof_buf, chunk_len, 0, NULL);
                 if (st != MINLZ_OK) {
                     goto decode_done;
                 }
-                st = minlz_read_uvarint(
+                st = minlz_read_uvarint64(
                     eof_buf, chunk_len, &want, &used);
-                if (st != MINLZ_OK || used != chunk_len || (uint64_t)want != total) {
+                if (st != MINLZ_OK || used != chunk_len || want != total) {
                     st = MINLZ_CORRUPT;
                     goto decode_done;
                 }
             }
             have_header = 0;
+            total = 0;
             continue;
         }
 
@@ -596,6 +597,7 @@ struct minlz_writer {
     uint8_t *in;
     size_t in_len;
     size_t in_cap;
+    int in_discrete;
     uint8_t *out;
     size_t out_cap;
     int header_written;
@@ -916,7 +918,8 @@ static minlz_status writer_flush_block(minlz_writer *w,
     return writer_flush_block_ex(w, src, len, NULL, 0, 0);
 }
 
-static minlz_status writer_flush_pending(minlz_writer *w, int final) {
+static minlz_status writer_flush_pending(minlz_writer *w, int final,
+                                         const uint8_t *next, size_t next_len) {
     while (w->in_len != 0u) {
         size_t block_len =
             w->in_len > w->opts.block_size ? w->opts.block_size : w->in_len;
@@ -927,8 +930,16 @@ static minlz_status writer_flush_pending(minlz_writer *w, int final) {
         if (overlap_len > w->search_overlap) {
             overlap_len = w->search_overlap;
         }
+        if (!final && overlap_len < w->search_overlap) {
+            size_t need = w->search_overlap - overlap_len;
+            if (next_len >= need) {
+                /* The input buffer has block_size + search_overlap bytes.
+                 * Borrow lookahead without adding it to the pending input. */
+                memcpy(w->in + w->in_len, next, need);
+                overlap_len += need;
+            }
+        }
         allow_table = final ||
-                      !w->has_search ||
                       overlap_len == w->search_overlap;
         st = writer_flush_block_ex(
             w, w->in, block_len,
@@ -942,6 +953,7 @@ static minlz_status writer_flush_pending(minlz_writer *w, int final) {
         }
         w->in_len = remaining;
     }
+    w->in_discrete = 0;
     return MINLZ_OK;
 }
 
@@ -1010,6 +1022,7 @@ minlz_status minlz_writer_reset(minlz_writer *writer, minlz_write_cb write_cb,
     writer->write_cb = write_cb;
     writer->write_ctx = write_ctx;
     writer->in_len = 0;
+    writer->in_discrete = 0;
     writer->header_written = 0;
     writer->closed = 0;
     writer->written = 0;
@@ -1032,6 +1045,12 @@ minlz_status minlz_writer_write(minlz_writer *writer, const uint8_t *src, size_t
         return MINLZ_CORRUPT;
     }
     if (writer->has_search) {
+        if (writer->in_discrete && len != 0u) {
+            st = writer_flush_pending(writer, 0, src, len);
+            if (st != MINLZ_OK) {
+                return st;
+            }
+        }
         while (done < len) {
             size_t ready = writer->opts.block_size +
                            writer->search_overlap;
@@ -1140,31 +1159,35 @@ minlz_status minlz_writer_read_from(minlz_writer *writer, minlz_read_cb read_cb,
 minlz_status minlz_writer_encode_buffer(minlz_writer *writer, const uint8_t *src,
                                         size_t len) {
     minlz_status st;
-    if (!writer) {
+    if (!writer || (!src && len != 0u) || writer->closed) {
         return MINLZ_CORRUPT;
+    }
+    if (writer->has_search && len != 0u) {
+        const size_t block_size = writer->opts.block_size;
+        const size_t overlap = writer->search_overlap;
+        st = writer_flush_pending(writer, 0, src, len);
+        if (st != MINLZ_OK) {
+            return st;
+        }
+        while (len > block_size && len - block_size >= overlap) {
+            st = writer_flush_block_ex(
+                writer, src, block_size, src + block_size, overlap, 1);
+            if (st != MINLZ_OK) {
+                return st;
+            }
+            src += block_size;
+            len -= block_size;
+        }
+        /* Keep the suffix until the next call supplies full search overlap.
+         * Mark the call boundary so Write does not merge its bytes into it. */
+        memcpy(writer->in, src, len);
+        writer->in_len = len;
+        writer->in_discrete = 1;
+        return MINLZ_OK;
     }
     st = minlz_writer_flush(writer);
     if (st != MINLZ_OK) {
         return st;
-    }
-    if (writer->has_search) {
-        while (len > 0) {
-            size_t n =
-                len > writer->opts.block_size ? writer->opts.block_size : len;
-            size_t overlap_len = len - n;
-            if (overlap_len > writer->search_overlap) {
-                overlap_len = writer->search_overlap;
-            }
-            st = writer_flush_block_ex(
-                writer, src, n,
-                overlap_len ? src + n : NULL, overlap_len, 1);
-            if (st != MINLZ_OK) {
-                return st;
-            }
-            src += n;
-            len -= n;
-        }
-        return MINLZ_OK;
     }
     while (len > 0) {
         size_t n = len > writer->opts.block_size ? writer->opts.block_size : len;
@@ -1214,7 +1237,7 @@ minlz_status minlz_writer_flush(minlz_writer *writer) {
         return !writer ? MINLZ_CORRUPT : MINLZ_OK;
     }
     st = writer->has_search
-             ? writer_flush_pending(writer, 0)
+             ? writer_flush_pending(writer, 0, NULL, 0u)
              : writer_flush_block(writer, writer->in, writer->in_len);
     if (st == MINLZ_OK) {
         writer->in_len = 0;
@@ -1244,7 +1267,7 @@ minlz_status minlz_writer_close_index(minlz_writer *writer, uint8_t **index,
         return MINLZ_OK;
     }
     st = writer->has_search
-             ? writer_flush_pending(writer, 1)
+             ? writer_flush_pending(writer, 1, NULL, 0u)
              : minlz_writer_flush(writer);
     if (st != MINLZ_OK || (st = writer_ensure_header(writer)) != MINLZ_OK) {
         return st;
@@ -1883,19 +1906,20 @@ static minlz_status reader_decode_stream_to_writer(minlz_reader *r, minlz_write_
                 goto decode_done;
             }
             if (chunk_len != 0) {
-                size_t want = 0;
+                uint64_t want = 0;
                 size_t used = 0;
                 st = minlz_read_exact(r->read_cb, r->read_ctx, tmp, chunk_len, 0, NULL);
                 if (st != MINLZ_OK) {
                     goto decode_done;
                 }
-                st = minlz_read_uvarint(tmp, chunk_len, &want, &used);
-                if (st != MINLZ_OK || used != chunk_len || (uint64_t)want != total) {
+                st = minlz_read_uvarint64(tmp, chunk_len, &want, &used);
+                if (st != MINLZ_OK || used != chunk_len || want != total) {
                     st = MINLZ_CORRUPT;
                     goto decode_done;
                 }
             }
             have_header = 0;
+            total = 0;
             continue;
         }
 

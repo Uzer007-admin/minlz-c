@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(minlz_c VERSION 1.2.0 LANGUAGES C)
+project(minlz_c VERSION 1.2.1 LANGUAGES C)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

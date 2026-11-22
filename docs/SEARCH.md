@@ -96,6 +96,11 @@ offset, and the absolute uncompressed stream offset. Return:
 - `MINLZ_SEARCH_FORWARD` to request forward context from either searcher.
 - another status to abort.
 
+Each match can request forward context independently. On a repeat callback,
+the previous buffer covers the match's original block through the last block
+shown to the callback. The current buffer is the next block, or empty at the
+end of the stream. Returning `MINLZ_SEARCH_FORWARD` again extends that context.
+
 Like Go `SearchResult.PrevBlock()`, C does not eagerly decode a previous block
 that the table proved irrelevant. Inside the callback, load it only when
 needed:

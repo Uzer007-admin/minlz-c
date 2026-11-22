@@ -519,6 +519,7 @@ minlz_status minlz_index_stream(minlz_read_cb read_cb, void *read_ctx,
     int have_header = 0;
     int64_t comp = 0;
     int64_t uncomp = 0;
+    int64_t stream_start = 0;
     size_t max_block = MINLZ_MAX_BLOCK_SIZE;
     minlz_status st;
 
@@ -540,6 +541,7 @@ minlz_status minlz_index_stream(minlz_read_cb read_cb, void *read_ctx,
         size_t got = 0;
         uint8_t type;
         size_t len;
+        size_t decoded_len = 0;
         st = minlz_read_exact(read_cb, read_ctx, hdr, sizeof(hdr), 1, &got);
         if (st != MINLZ_OK) {
             goto done;
@@ -575,6 +577,7 @@ minlz_status minlz_index_stream(minlz_read_cb read_cb, void *read_ctx,
                 }
                 max_block = (size_t)1u << (lg + 10u);
                 have_header = 1;
+                stream_start = uncomp;
                 continue;
             }
             st = MINLZ_UNSUPPORTED;
@@ -588,38 +591,32 @@ minlz_status minlz_index_stream(minlz_read_cb read_cb, void *read_ctx,
         }
         if (type == MINLZ_CHUNK_EOF) {
             uint8_t tmp[10];
-            size_t want = 0, used = 0;
+            uint64_t want = 0;
+            size_t used = 0;
+            if (len > sizeof(tmp)) {
+                st = MINLZ_CORRUPT;
+                goto done;
+            }
             if (len != 0) {
-                size_t n = len < sizeof(tmp) ? len : sizeof(tmp);
-                st = minlz_read_exact(read_cb, read_ctx, tmp, n, 0, NULL);
-                if (st == MINLZ_OK && len > n) {
-                    st = minlz_skip_exact(read_cb, read_ctx, len - n);
-                }
+                st = minlz_read_exact(read_cb, read_ctx, tmp, len, 0, NULL);
                 if (st != MINLZ_OK) {
                     goto done;
                 }
-                st = minlz_read_uvarint(tmp, n, &want, &used);
-                if (st != MINLZ_OK || used != len || (uint64_t)want != (uint64_t)uncomp) {
+                st = minlz_read_uvarint64(tmp, len, &want, &used);
+                if (st != MINLZ_OK || used != len ||
+                    want != (uint64_t)(uncomp - stream_start)) {
                     st = MINLZ_CORRUPT;
                     goto done;
                 }
             }
             have_header = 0;
+            stream_start = uncomp;
         } else if (type == MINLZ_CHUNK_UNCOMPRESSED) {
-            size_t dlen;
             if (len < MINLZ_CHECKSUM_SIZE || len - MINLZ_CHECKSUM_SIZE > max_block) {
                 st = MINLZ_CORRUPT;
                 goto done;
             }
-            dlen = len - MINLZ_CHECKSUM_SIZE;
-            if (idx->est_block_uncomp == 0) {
-                idx->est_block_uncomp = (int64_t)dlen;
-            }
-            st = minlz_index_add_pair(idx, comp, uncomp);
-            if (st != MINLZ_OK) {
-                goto done;
-            }
-            uncomp += (int64_t)dlen;
+            decoded_len = len - MINLZ_CHECKSUM_SIZE;
             st = minlz_skip_exact(read_cb, read_ctx, len);
             if (st != MINLZ_OK) {
                 goto done;
@@ -627,7 +624,7 @@ minlz_status minlz_index_stream(minlz_read_cb read_cb, void *read_ctx,
         } else if (type == MINLZ_CHUNK_MINLZ || type == MINLZ_CHUNK_MINLZ_COMP_CRC) {
             uint8_t prefix[MINLZ_CHECKSUM_SIZE + 10u];
             size_t prefix_len;
-            size_t dlen = 0, hlen = 0;
+            size_t hlen = 0;
             if (len < MINLZ_CHECKSUM_SIZE) {
                 st = MINLZ_CORRUPT;
                 goto done;
@@ -641,20 +638,12 @@ minlz_status minlz_index_stream(minlz_read_cb read_cb, void *read_ctx,
                 goto done;
             }
             st = minlz_payload_decoded_len(prefix + MINLZ_CHECKSUM_SIZE,
-                                           prefix_len - MINLZ_CHECKSUM_SIZE, &dlen, &hlen);
+                                           prefix_len - MINLZ_CHECKSUM_SIZE, &decoded_len, &hlen);
             (void)hlen;
-            if (st != MINLZ_OK || dlen > max_block) {
+            if (st != MINLZ_OK || decoded_len > max_block) {
                 st = st == MINLZ_OK ? MINLZ_TOO_LARGE : st;
                 goto done;
             }
-            if (idx->est_block_uncomp == 0) {
-                idx->est_block_uncomp = (int64_t)dlen;
-            }
-            st = minlz_index_add_pair(idx, comp, uncomp);
-            if (st != MINLZ_OK) {
-                goto done;
-            }
-            uncomp += (int64_t)dlen;
         } else if (type <= MINLZ_MAX_NON_SKIPPABLE_CHUNK ||
                    (type >= 0xc0u && type <= MINLZ_MAX_USER_NON_SKIPPABLE_CHUNK)) {
             st = MINLZ_UNSUPPORTED;
@@ -664,6 +653,16 @@ minlz_status minlz_index_stream(minlz_read_cb read_cb, void *read_ctx,
             if (st != MINLZ_OK) {
                 goto done;
             }
+        }
+        if (decoded_len != 0u) {
+            if (idx->est_block_uncomp == 0) {
+                idx->est_block_uncomp = (int64_t)decoded_len;
+            }
+            st = minlz_index_add_pair(idx, comp, uncomp);
+            if (st != MINLZ_OK) {
+                goto done;
+            }
+            uncomp += (int64_t)decoded_len;
         }
         comp += (int64_t)(MINLZ_CHUNK_HEADER_SIZE + len);
     }

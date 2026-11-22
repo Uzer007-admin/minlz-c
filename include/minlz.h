@@ -19,7 +19,7 @@ extern "C" {
 #endif
 
 #define MINLZ_SPEC_VERSION "v1.0"
-#define MINLZ_VERSION_STRING "1.2.0"
+#define MINLZ_VERSION_STRING "1.2.1"
 #define MINLZ_SEARCH_SPEC_VERSION "v1.2.0"
 #define MINLZ_MAX_BLOCK_SIZE (8u << 20)
 #define MINLZ_MIN_BLOCK_SIZE (4u << 10)
@@ -347,6 +347,8 @@ minlz_status minlz_writer_write(minlz_writer *writer, const uint8_t *src, size_t
                                 size_t *written);
 minlz_status minlz_writer_read_from(minlz_writer *writer, minlz_read_cb read_cb,
                                     void *read_ctx, uint64_t *read_total);
+/* With search enabled, the final block may be buffered until the next write,
+ * Flush or Close. The writer copies any data retained after this call. */
 minlz_status minlz_writer_encode_buffer(minlz_writer *writer, const uint8_t *src,
                                         size_t len);
 minlz_status minlz_writer_add_user_chunk(minlz_writer *writer, uint8_t id,
