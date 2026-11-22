@@ -226,6 +226,18 @@ static int test_balanced_16k_hash_loop(void) {
             CHECK(roundtrip(data, sizes[j], MINLZ_LEVEL_BALANCED) == 0);
         }
     }
+    /* Exercise repeat indexing on a block with many short matches. */
+    uint32_t state = UINT32_C(0xff226c0c);
+    for (i = 0; i < 8191u; ++i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        data[i] = (uint8_t)(state >> 24);
+        if (i >= 4u) {
+            data[i] &= 3u;
+        }
+    }
+    CHECK(roundtrip(data, 8191u, MINLZ_LEVEL_BALANCED) == 0);
     return 0;
 }
 

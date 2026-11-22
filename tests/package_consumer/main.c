@@ -9,7 +9,7 @@ int main(void) {
     size_t encoded_len = 0;
     size_t decoded_len = 0;
 
-    if (strcmp(MINLZ_VERSION_STRING, "1.2.2") != 0) {
+    if (strcmp(MINLZ_VERSION_STRING, "1.2.3") != 0) {
         return 1;
     }
     if (minlz_encode(encoded, sizeof(encoded), &encoded_len,

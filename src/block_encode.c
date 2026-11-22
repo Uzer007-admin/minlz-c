@@ -5680,9 +5680,12 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_better_block_2mb_inline_asm(uint8
 static MINLZ_ALWAYS_INLINE size_t minlz_encode_better_block_16k_inline_asm(uint8_t *dst,
                                                                           const uint8_t *src,
                                                                           size_t src_len,
-                                                                          uint8_t *tmp) {
+                                                                          uint8_t *tmp,
+                                                                          size_t direct_limit) {
 #if MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
     size_t ret;
+    /* The repeat-table loop writes r15. Expose it to the compiler. */
+    register size_t repeat_index __asm__("r15");
     __asm__ volatile(
         "pushq %%rbx\n"
         "pushq %%r12\n"
@@ -5693,6 +5696,7 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_better_block_16k_inline_asm(uint8
         "movq %[src], 32(%%rsp)\n"
         "movq %[src_len], 40(%%rsp)\n"
         "movq %[tmp], 48(%%rsp)\n"
+        "xorl %k[repeat_index], %k[repeat_index]\n"
         "movq 48(%%rsp), %%rdi\n"
         "xorl %%eax, %%eax\n"
         "movl $0x00001200, %%ecx\n"
@@ -6048,11 +6052,11 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_better_block_16k_inline_asm(uint8
         "imulq %%r8, %%r13\n"
         "shrq $0x35, %%r13\n"
         "leaq 1(%%rbx), %%r14\n"
-        "leaq 1(%%r9), %%r15\n"
+        "leaq 1(%%r9), %[repeat_index]\n"
         "movw %%bx, (%%rsi,%%r10,2)\n"
         "movw %%r14w, 32768(%%rsi,%%r11,2)\n"
         "movw %%r9w, (%%rsi,%%r12,2)\n"
-        "movw %%r15w, 32768(%%rsi,%%r13,2)\n"
+        "movw %w[repeat_index], 32768(%%rsi,%%r13,2)\n"
         "addq $0x02, %%rbx\n"
         "subq $0x02, %%r9\n"
         "jmp .Lminlz_better16k_%=_repeat_index_loop_encodeBetterBlockAsm16K\n"
@@ -6851,16 +6855,23 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_better_block_16k_inline_asm(uint8
         "popq %%r13\n"
         "popq %%r12\n"
         "popq %%rbx\n"
-        : "=&a"(ret)
+        : "=&a"(ret), [repeat_index] "=&r"(repeat_index)
         : [dst] "r"(dst), [src] "r"(src), [src_len] "r"(src_len), [tmp] "r"(tmp)
         : "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
           "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory", "cc");
+    /* Preserve the v1.2.2 direct path's fallback when its size check
+     * included the last repeat-table position. Only ret is the length
+     * of the encoded payload. */
+    if (direct_limit != 0u && ret + repeat_index > direct_limit) {
+        return 0;
+    }
     return ret;
 #else
     (void)dst;
     (void)src;
     (void)src_len;
     (void)tmp;
+    (void)direct_limit;
     return 0;
 #endif
 }
@@ -8551,7 +8562,7 @@ static size_t minlz_encode_payload_periodic_repeat_ws(minlz_workspace *ws,
                 uint8_t *scratch = NULL;
                 if (minlz_workspace_prepare_encode_scratch(ws, 2, 36864u, &scratch) == MINLZ_OK) {
                     n = minlz_encode_better_block_16k_inline_asm(
-                        dst, src, period, scratch);
+                        dst, src, period, scratch, 0u);
                     if (n == 0) {
                         n = minlz_encode_better_amd64_inline_ws(ws, dst, dst_cap, src, period);
                     }
@@ -9725,7 +9736,7 @@ static size_t minlz_encode_better_amd64_inline_ws(minlz_workspace *ws, uint8_t *
             }
 #endif
 #if MINLZ_ENABLE_BETTER16K_INLINE_ASM
-            n = minlz_encode_better_block_16k_inline_asm(dst, src, src_len, scratch_buf);
+            n = minlz_encode_better_block_16k_inline_asm(dst, src, src_len, scratch_buf, 0u);
 #else
             n = minlz_encode_better_block_16k_goasm(dst, dst_cap, src, src_len, scratch_buf);
 #endif
@@ -10885,7 +10896,7 @@ static MINLZ_NOINLINE minlz_status minlz_encode_ws_nonraw(
                 dst[0] = 0;
 #if MINLZ_ENABLE_BETTER16K_INLINE_ASM
                 n = minlz_encode_better_block_16k_inline_asm(
-                    dst + 1u + h, src, src_len, scratch);
+                    dst + 1u + h, src, src_len, scratch, max_len - 1u);
 #else
                 n = minlz_encode_better_block_16k_goasm(
                     dst + 1u + h, dst_cap - 1u - h, src, src_len, scratch);
