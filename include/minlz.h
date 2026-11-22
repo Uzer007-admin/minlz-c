@@ -19,7 +19,7 @@ extern "C" {
 #endif
 
 #define MINLZ_SPEC_VERSION "v1.0"
-#define MINLZ_VERSION_STRING "1.2.1"
+#define MINLZ_VERSION_STRING "1.2.2"
 #define MINLZ_SEARCH_SPEC_VERSION "v1.2.0"
 #define MINLZ_MAX_BLOCK_SIZE (8u << 20)
 #define MINLZ_MIN_BLOCK_SIZE (4u << 10)

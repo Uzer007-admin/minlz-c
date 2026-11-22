@@ -7214,13 +7214,25 @@ static MINLZ_ALWAYS_INLINE size_t minlz_encode_payload_fastest_impl(
                         d = 0;
                         goto done;
                     }
-                    n = minlz_emit_literal_fast(dst + d, src + next_emit, (size_t)lit_len);
-                    if (n == 0) {
-                        d = 0;
-                        goto done;
+                    if (!check_offsets && (unsigned)(lit_len - 4) <= 3u &&
+                        (unsigned)(length - 19) <= 45u && (unsigned)repeat <= MINLZ_MAX_COPY2_OFFSET) {
+                        const uint32_t copy1 = ((uint32_t)(repeat - 1) << 6) |
+                            (15u << 2) | MINLZ_TAG_COPY1 | ((uint32_t)(length - 18) << 16);
+                        const uint32_t copy2 = ((uint32_t)(repeat - MINLZ_MIN_COPY2_OFFSET) << 8) |
+                            ((uint32_t)(length - 4) << 2) | MINLZ_TAG_COPY2;
+                        const uint32_t copy = (unsigned)repeat <= MINLZ_MAX_COPY1_OFFSET
+                            ? copy1 : copy2;
+                        /* The match supplies enough input for the word load.
+                         * The second store overlaps the literal and writes
+                         * the three-byte copy without writing past it. */
+                        minlz_store64(dst + d, (minlz_load64(src + next_emit) << 8) |
+                            ((uint64_t)(lit_len - 1) << 3));
+                        minlz_store32(dst + d + lit_len, (copy << 8) | src[base - 1]);
+                        n = (size_t)lit_len + 4u;
+                    } else {
+                        d += (int)minlz_emit_literal_fast(dst + d, src + next_emit, (size_t)lit_len);
+                        n = minlz_emit_copy_fast(dst + d, (size_t)repeat, (size_t)length);
                     }
-                    d += (int)n;
-                    n = minlz_emit_copy_fast(dst + d, (size_t)repeat, (size_t)length);
                 } else if (repeat <= (int)MINLZ_MAX_COPY2_OFFSET) {
                     n = minlz_emit_copy_lits2_fast(dst + d, src + next_emit, (size_t)lit_len,
                                                    (size_t)repeat, (size_t)length);
@@ -9410,6 +9422,25 @@ done:
 }
 #endif
 
+/* Find starts of four matching bytes in the first five positions.
+ * A borrow in the zero-byte test can set a later flag, but the first
+ * flagged byte is always zero. */
+static MINLZ_ALWAYS_INLINE uint64_t minlz_repeat4_starts(uint64_t difference) {
+    difference |= difference >> 8;
+    difference |= difference >> 16;
+    return (difference - UINT64_C(0x0101010101010101)) & ~difference &
+        UINT64_C(0x0000008080808080);
+}
+
+static MINLZ_ALWAYS_INLINE size_t minlz_emit_tiny_literal(uint8_t *dst, size_t dst_cap,
+                                                        const uint8_t *src, size_t len) {
+    /* Literals in this bucket use at most three tag bytes. */
+    if (MINLZ_LIKELY(len + 3u <= dst_cap)) {
+        return minlz_emit_literal_fast(dst, src, len);
+    }
+    return minlz_emit_literal(dst, dst_cap, src, len);
+}
+
 static size_t minlz_encode_balanced_tiny_repeat4(uint8_t * restrict dst, size_t dst_cap,
                                                  const uint8_t * restrict src,
                                                  size_t src_len) {
@@ -9423,28 +9454,38 @@ static size_t minlz_encode_balanced_tiny_repeat4(uint8_t * restrict dst, size_t 
         return 0;
     }
     memset(table, 0, sizeof(table));
-    table[minlz_hash4(minlz_load32(src), 10)] = 1u;
+    /* An untouched entry also refers to position zero. A word can only
+     * match there when it hashes to the same slot as the first word. */
     while (s + 4u <= src_len) {
-        if (matches != 0u) {
-            if (repeat == 28u && s + 32u <= src_len &&
-                minlz_load32(src + s + 28u) == minlz_load32(src + s)) {
-                s += 28u;
+        uint32_t cv = minlz_load32(src + s);
+        uint32_t h = minlz_hash4(cv, 10);
+        size_t candidate = table[h];
+        size_t offset = s - candidate;
+        table[h] = (uint16_t)s;
+        if (offset <= MINLZ_MAX_COPY1_OFFSET && cv == minlz_load32(src + candidate)) {
+            size_t base = s;
+            size_t cand_end = candidate + 4u;
+            size_t s_end = s + 4u;
+            size_t length;
+            size_t n;
+            minlz_extend_match_size(src, &s_end, &cand_end, src_len);
+            length = s_end - base;
+            if (length > 18u) {
+                length = 18u;
+                s_end = base + length;
             }
-            if (repeat <= s && minlz_load32(src + s) == minlz_load32(src + s - repeat)) {
-                size_t base = s;
-                size_t cand_end = s - repeat + 4u;
-                size_t s_end = s + 4u;
-                size_t length;
-                size_t n;
-                minlz_extend_match_size(src, &s_end, &cand_end, src_len);
-                length = s_end - base;
-                if (base > next_emit) {
-                    n = minlz_emit_literal_fast(dst + d, src + next_emit, base - next_emit);
-                    if (n == 0 || d + n > dst_cap) {
-                        return 0;
-                    }
-                    d += n;
+            if (length < 4u) {
+                s++;
+                continue;
+            }
+            if (base > next_emit) {
+                n = minlz_emit_tiny_literal(dst + d, dst_cap - d, src + next_emit, base - next_emit);
+                if (n == 0) {
+                    return 0;
                 }
+                d += n;
+            }
+            if (offset == repeat) {
                 if (MINLZ_LIKELY(length < 30u)) {
                     if (MINLZ_UNLIKELY(d >= dst_cap)) {
                         return 0;
@@ -9452,102 +9493,108 @@ static size_t minlz_encode_balanced_tiny_repeat4(uint8_t * restrict dst, size_t 
                     dst[d++] = (uint8_t)(((length - 1u) << 3) | MINLZ_TAG_REPEAT);
                 } else {
                     n = minlz_emit_repeat(dst + d, dst_cap - d, length);
-                    if (n == 0 || d + n > dst_cap) {
+                    if (n == 0) {
                         return 0;
                     }
                     d += n;
                 }
-                matches++;
-                s = s_end;
-                next_emit = s;
-                continue;
-            }
-            s++;
-            continue;
-        }
-        uint32_t cv = minlz_load32(src + s);
-        uint32_t h = minlz_hash4(cv, 10);
-        uint16_t prev = table[h];
-        table[h] = (uint16_t)(s + 1u);
-        if (prev != 0) {
-            size_t candidate = (size_t)prev - 1u;
-            size_t offset = s - candidate;
-            if (offset <= MINLZ_MAX_COPY1_OFFSET &&
-                cv == minlz_load32(src + candidate)) {
-                size_t base = s;
-                size_t cand_end = candidate + 4u;
-                size_t s_end = s + 4u;
-                size_t length;
-                size_t n;
-                size_t fill;
-                minlz_extend_match_size(src, &s_end, &cand_end, src_len);
-                length = s_end - base;
-                if (length > 18u) {
-                    length = 18u;
-                    s_end = base + length;
-                }
-                if (length < 4u) {
-                    s++;
-                    continue;
-                }
-                if (base > next_emit) {
-                    n = minlz_emit_literal_fast(dst + d, src + next_emit, base - next_emit);
-                    if (n == 0 || d + n > dst_cap) {
+            } else {
+                if (MINLZ_LIKELY(length < 19u)) {
+                    uint16_t enc;
+                    if (MINLZ_UNLIKELY(d + 2u > dst_cap)) {
                         return 0;
                     }
-                    d += n;
-                }
-                if (offset == repeat) {
-                    if (MINLZ_LIKELY(length < 30u)) {
-                        if (MINLZ_UNLIKELY(d >= dst_cap)) {
-                            return 0;
-                        }
-                        dst[d++] = (uint8_t)(((length - 1u) << 3) | MINLZ_TAG_REPEAT);
-                    } else {
-                        n = minlz_emit_repeat(dst + d, dst_cap - d, length);
-                        if (n == 0 || d + n > dst_cap) {
-                            return 0;
-                        }
-                        d += n;
-                    }
+                    enc = (uint16_t)(((offset - 1u) << 6) |
+                                     ((length - 4u) << 2) |
+                                     MINLZ_TAG_COPY1);
+                    minlz_store16(dst + d, enc);
+                    d += 2u;
                 } else {
-                    if (MINLZ_LIKELY(length < 19u)) {
-                        uint16_t enc;
-                        if (MINLZ_UNLIKELY(d + 2u > dst_cap)) {
-                            return 0;
-                        }
-                        enc = (uint16_t)(((offset - 1u) << 6) |
-                                         ((length - 4u) << 2) |
-                                         MINLZ_TAG_COPY1);
-                        minlz_store16(dst + d, enc);
-                        d += 2u;
-                    } else {
-                        n = minlz_emit_copy(dst + d, dst_cap - d, offset, length);
-                        if (n == 0 || d + n > dst_cap) {
-                            return 0;
-                        }
-                        d += n;
+                    n = minlz_emit_copy(dst + d, dst_cap - d, offset, length);
+                    if (n == 0) {
+                        return 0;
                     }
-                    repeat = offset;
+                    d += n;
                 }
-                matches++;
-                for (fill = base + 1u; fill < s_end && fill + 4u <= src_len; fill++) {
-                    uint32_t fv = minlz_load32(src + fill);
-                    table[minlz_hash4(fv, 10)] = (uint16_t)(fill + 1u);
-                }
-                s = s_end;
-                next_emit = s;
-                continue;
+                repeat = offset;
             }
+            matches++;
+            s = s_end;
+            next_emit = s;
+            break;
         }
         s++;
+    }
+    /* After the first match only the selected offset is searched. */
+    while (s + 4u <= src_len) {
+        if (repeat == 28u && s + 32u <= src_len &&
+            minlz_load32(src + s + 28u) == minlz_load32(src + s)) {
+            s += 28u;
+        }
+        if (repeat <= s && minlz_load32(src + s) == minlz_load32(src + s - repeat)) {
+            size_t base = s;
+            size_t cand_end = s - repeat + 4u;
+            size_t s_end = s + 4u;
+            size_t length;
+            size_t n;
+            minlz_extend_match_size(src, &s_end, &cand_end, src_len);
+            length = s_end - base;
+            if (base > next_emit) {
+                n = minlz_emit_tiny_literal(dst + d, dst_cap - d, src + next_emit, base - next_emit);
+                if (n == 0) {
+                    return 0;
+                }
+                d += n;
+            }
+            if (MINLZ_LIKELY(length < 30u)) {
+                if (MINLZ_UNLIKELY(d >= dst_cap)) {
+                    return 0;
+                }
+                dst[d++] = (uint8_t)(((length - 1u) << 3) | MINLZ_TAG_REPEAT);
+            } else {
+                n = minlz_emit_repeat(dst + d, dst_cap - d, length);
+                if (n == 0) {
+                    return 0;
+                }
+                d += n;
+            }
+            matches++;
+            s = s_end;
+            next_emit = s;
+            continue;
+        }
+        s++;
+        if (repeat != 28u && repeat <= s) {
+            while (src_len - s >= 8u) {
+                const uint64_t difference = minlz_load64(src + s) ^ minlz_load64(src + s - repeat);
+                const uint64_t starts = minlz_repeat4_starts(difference);
+                if (starts != 0) {
+                    s += minlz_ctz64(starts) >> 3;
+                    break;
+                }
+                s += 5u;
+            }
+        } else if (repeat == 28u && repeat <= s) {
+            /* Keep the earlier of a repeat and the special lookahead. */
+            while (src_len - s >= 36u) {
+                const uint64_t current = minlz_load64(src + s);
+                const uint64_t starts =
+                    minlz_repeat4_starts(current ^ minlz_load64(src + s - 28u)) |
+                    minlz_repeat4_starts(current ^ minlz_load64(src + s + 28u));
+                if (starts != 0) {
+                    s += minlz_ctz64(starts) >> 3;
+                    break;
+                }
+                s += 5u;
+            }
+        }
     }
     if (matches < 4u) {
         return 0;
     }
     if (next_emit < src_len) {
-        size_t n = minlz_emit_literal_fast(dst + d, src + next_emit, src_len - next_emit);
-        if (n == 0 || d + n > dst_cap) {
+        size_t n = minlz_emit_tiny_literal(dst + d, dst_cap - d, src + next_emit, src_len - next_emit);
+        if (n == 0) {
             return 0;
         }
         d += n;
