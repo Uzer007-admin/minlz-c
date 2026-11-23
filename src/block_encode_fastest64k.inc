@@ -1,3 +1,9 @@
+#if defined(MINLZ_FASTEST64K_LITERAL)
+#define MINLZ_FASTEST64K_LITERAL_IMPL minlz_emit_literal_4k
+#else
+#define MINLZ_FASTEST64K_LITERAL_IMPL minlz_emit_literal_inline_fast
+#endif
+
 #if defined(MINLZ_FASTEST64K_FIXED_INLINE_PROBE)
 #define MINLZ_FASTEST64K_EXTEND(src, s, candidate, src_len) \
     minlz_extend_match_int_fastest_impl((src), (s), (candidate), (src_len), MINLZ_L1_MATCH_LONG_SSE2)
@@ -166,7 +172,7 @@ static MINLZ_ALWAYS_INLINE size_t MINLZ_FASTEST64K_IMPL(minlz_workspace *ws, uin
                     d = 0;
                     goto done;
                 }
-                n = minlz_emit_literal_inline_fast(dst + d, src + next_emit,
+                n = MINLZ_FASTEST64K_LITERAL_IMPL(dst + d, src + next_emit,
                                                    (size_t)(base - next_emit));
                 if (n == 0 && base != next_emit) {
                     d = 0;
@@ -237,7 +243,7 @@ static MINLZ_ALWAYS_INLINE size_t MINLZ_FASTEST64K_IMPL(minlz_workspace *ws, uin
                         d = 0;
                         goto done;
                     }
-                    n = minlz_emit_literal_inline_fast(dst + d, src + next_emit, (size_t)lit_len);
+                    n = MINLZ_FASTEST64K_LITERAL_IMPL(dst + d, src + next_emit, (size_t)lit_len);
                     if (n == 0) {
                         d = 0;
                         goto done;
@@ -309,7 +315,7 @@ emit_remainder:
             d = 0;
             goto done;
         }
-        n = minlz_emit_literal_inline_fast(dst + d, src + next_emit,
+        n = MINLZ_FASTEST64K_LITERAL_IMPL(dst + d, src + next_emit,
                                            src_len - (size_t)next_emit);
         if (n == 0) {
             d = 0;
@@ -327,3 +333,5 @@ done:
 
 
 #undef MINLZ_FASTEST64K_EXTEND
+
+#undef MINLZ_FASTEST64K_LITERAL_IMPL

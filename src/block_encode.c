@@ -7032,11 +7032,38 @@ static MINLZ_ALWAYS_INLINE void minlz_clear_l1_table_avx2(uint8_t *p, size_t n) 
 #undef MINLZ_FASTEST64K_ENTRY_BYTES
 
 #if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+#if defined(__linux__)
+static MINLZ_ALWAYS_INLINE size_t minlz_emit_literal_4k(uint8_t *dst, const uint8_t *lit, size_t len) {
+    if (len >= 30u && len <= 64u) {
+        minlz_store16(dst, (uint16_t)((29u << 3) | ((len - 30u) << 8)));
+        uint8_t *d = dst + 2u;
+        const __m128i head = _mm_loadu_si128((const __m128i *)(const void *)lit);
+        const __m128i tail = _mm_loadu_si128((const __m128i *)(const void *)(lit + len - 16u));
+        _mm_storeu_si128((__m128i *)(void *)d, head);
+        if (len > 32u) {
+            const __m128i middle = _mm_loadu_si128((const __m128i *)(const void *)(lit + 16u));
+            _mm_storeu_si128((__m128i *)(void *)(d + 16u), middle);
+            if (len > 48u) {
+                const __m128i extra = _mm_loadu_si128((const __m128i *)(const void *)(lit + 32u));
+                _mm_storeu_si128((__m128i *)(void *)(d + 32u), extra);
+            }
+        }
+        _mm_storeu_si128((__m128i *)(void *)(d + len - 16u), tail);
+        return len + 2u;
+    }
+    return minlz_emit_literal_inline_fast(dst, lit, len);
+}
+
+#define MINLZ_FASTEST64K_IMPL minlz_encode_payload_fastest4k_ws
+#define MINLZ_FASTEST64K_LITERAL 1
+#else
 #define MINLZ_FASTEST64K_IMPL minlz_encode_payload_fastest4k_prefix_ws
+#define MINLZ_FASTEST64K_PREFIX_SSE2 1
+#endif
 #define MINLZ_FASTEST64K_ENTRY uint16_t
 #define MINLZ_FASTEST64K_ENTRY_BYTES 2
-#define MINLZ_FASTEST64K_PREFIX_SSE2 1
 #include "block_encode_fastest64k.inc"
+#undef MINLZ_FASTEST64K_LITERAL
 #undef MINLZ_FASTEST64K_PREFIX_SSE2
 #undef MINLZ_FASTEST64K_IMPL
 #undef MINLZ_FASTEST64K_ENTRY
@@ -7074,10 +7101,14 @@ static size_t minlz_encode_payload_fastest64k_ws(minlz_workspace *ws, uint8_t * 
     }
     if (src_len <= 4096u) {
 #if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+#if defined(__linux__)
+        return minlz_encode_payload_fastest4k_ws(ws, dst, dst_cap, src, src_len, 10, 4);
+#else
         if (_mm_movemask_epi8(_mm_cmpgt_epi8(
                 _mm_loadu_si128((const __m128i *)(const void *)src), _mm_set1_epi8(31))) == 0xffff) {
             return minlz_encode_payload_fastest4k_prefix_ws(ws, dst, dst_cap, src, src_len, 10, 4);
         }
+#endif
 #endif
         return minlz_encode_payload_fastest64k_impl_ws(ws, dst, dst_cap, src, src_len, 10, 4);
     }
