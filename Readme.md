@@ -8,7 +8,7 @@ This implements the MinLZ specification v1.0, including the v1.2.0 search
 and sidecar extensions. Go is optional and serves as the compatibility
 reference for tests and benchmarks.
 
-The current C library release is **1.2.4**.
+The current C library release is **1.2.5**.
 
 ## Features
 

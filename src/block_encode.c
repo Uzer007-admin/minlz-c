@@ -393,6 +393,11 @@ size_t minlz_encode_l1_block_2mb_goasm(uint8_t *dst, size_t dst_cap,
 size_t minlz_encode_l1_block_8m_goasm(uint8_t *dst, size_t dst_cap,
                                       const uint8_t *src, size_t src_len,
                                       uint8_t *tmp);
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+size_t minlz_encode_l1_block_8m_cached(uint8_t *dst, size_t dst_cap,
+                                      const uint8_t *src, size_t src_len,
+                                      uint8_t *tmp) __attribute__((visibility("hidden")));
+#endif
 size_t minlz_encode_better_block_8m_goasm(uint8_t *dst, size_t dst_cap,
                                           const uint8_t *src, size_t src_len,
                                           uint8_t *tmp);
@@ -8819,7 +8824,16 @@ static size_t minlz_encode_fast_amd64_inline_ws(minlz_workspace *ws, uint8_t * r
 #endif
 #if MINLZ_ENABLE_L1_8M_GOASM
     if (src_len > (2u << 20) && minlz_backend_has_inline_asm_amd64()) {
-        size_t n = minlz_encode_l1_block_8m_goasm(dst, dst_cap, src, src_len, scratch_buf);
+        size_t n;
+#if MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+        /* Sample across the block before selecting the binary search path. */
+        if (incompressible_checked && minlz_l1_use_c_search(src, src_len)) {
+            n = minlz_encode_l1_block_8m_cached(dst, dst_cap, src, src_len, scratch_buf);
+        } else
+#endif
+        {
+            n = minlz_encode_l1_block_8m_goasm(dst, dst_cap, src, src_len, scratch_buf);
+        }
         if (n != 0) {
             return n;
         }
@@ -9483,6 +9497,30 @@ static MINLZ_ALWAYS_INLINE size_t minlz_emit_tiny_literal(uint8_t *dst, size_t d
     return minlz_emit_literal(dst, dst_cap, src, len);
 }
 
+#if defined(__linux__) && MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+static MINLZ_ALWAYS_INLINE uint32_t minlz_repeat4_starts_sse2(const uint8_t *src,
+                                                            const uint8_t *candidate) {
+    const __m128i a = _mm_loadu_si128((const __m128i *)(const void *)src);
+    const __m128i b = _mm_loadu_si128((const __m128i *)(const void *)candidate);
+    uint32_t bits = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(a, b));
+    bits &= bits >> 1;
+    return bits & (bits >> 2);
+}
+
+static MINLZ_NOINLINE size_t minlz_skip_short_repeat_sse2(const uint8_t *src, size_t src_len,
+                                                       size_t s, size_t repeat) {
+    /* Overlap by three bytes to check repeats crossing vectors. */
+    while (src_len - s >= 16u) {
+        const uint32_t bits = minlz_repeat4_starts_sse2(src + s, src + s - repeat);
+        if (bits != 0u) {
+            return s + minlz_ctz64(bits);
+        }
+        s += 13u;
+    }
+    return s;
+}
+#endif
+
 static size_t minlz_encode_balanced_tiny_repeat4(uint8_t * restrict dst, size_t dst_cap,
                                                  const uint8_t * restrict src,
                                                  size_t src_len) {
@@ -9607,6 +9645,17 @@ static size_t minlz_encode_balanced_tiny_repeat4(uint8_t * restrict dst, size_t 
         }
         s++;
         if (repeat != 28u && repeat <= s) {
+#if defined(__linux__) && MINLZ_ENABLE_INTRINSICS && MINLZ_HAVE_INLINE_ASM_AMD64
+            if (src_len - s >= 64u) {
+                /* Avoid a call when the next repeat is in the first vector. */
+                const uint32_t bits = minlz_repeat4_starts_sse2(src + s, src + s - repeat);
+                if (bits != 0u) {
+                    s += minlz_ctz64(bits);
+                    continue;
+                }
+                s = minlz_skip_short_repeat_sse2(src, src_len, s + 13u, repeat);
+            }
+#endif
             while (src_len - s >= 8u) {
                 const uint64_t difference = minlz_load64(src + s) ^ minlz_load64(src + s - repeat);
                 const uint64_t starts = minlz_repeat4_starts(difference);

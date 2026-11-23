@@ -7,26 +7,132 @@
  */
 #include "minlz_internal.h"
 #if MINLZ_HAVE_INLINE_ASM_AMD64 && !defined(_WIN32)
+
+/* A slot stores a 23-bit position and nine bits of the source word.
+ * The tag rejects most candidates before fetching the full source word. */
+typedef uint32_t minlz_l1_8m_entry;
+
+#define MINLZ_L1_8M_POSITION_MASK UINT32_C(0x007fffff)
+#define MINLZ_L1_8M_WORD_MASK UINT32_C(0xff800000)
+_Static_assert(MINLZ_MAX_BLOCK_SIZE == (UINT32_C(1) << 23), "L1 search position bits");
+
+enum {
+    MINLZ_L1_8M_END = 0,
+    MINLZ_L1_8M_REPEAT = 1,
+    MINLZ_L1_8M_MATCH = 2
+};
+
+/* SysV returns the two positions in RAX and the result kind in EDX. */
+typedef struct {
+    uint32_t pos;
+    uint32_t candidate;
+    uint32_t kind;
+} minlz_l1_8m_result;
+
+static inline uint32_t minlz_l1_8m_hash(uint64_t word) {
+    return (uint32_t)((word * UINT64_C(0xcf1bbcdcbf9b0000)) >> 49);
+}
+
+static inline minlz_l1_8m_entry minlz_l1_8m_pack(uint32_t pos, uint32_t word) {
+    return pos | (word & MINLZ_L1_8M_WORD_MASK);
+}
+
+static inline int minlz_l1_8m_find(minlz_l1_8m_entry entry, uint32_t word,
+                                  uint32_t low, const uint8_t *src) {
+    const uint32_t pos = entry & MINLZ_L1_8M_POSITION_MASK;
+    /* A stale slot is probed at the window boundary, with different bytes. */
+    if (MINLZ_UNLIKELY(pos < low)) {
+        return minlz_load32(src + low) == word ? (int)low : -1;
+    }
+    return ((entry ^ word) & MINLZ_L1_8M_WORD_MASK) == 0 &&
+        minlz_load32(src + pos) == word ? (int)pos : -1;
+}
+
+static __attribute__((used, noinline)) minlz_l1_8m_result
+minlz_l1_8m_scan(minlz_l1_8m_entry *restrict table, const uint8_t *restrict src,
+                  uint32_t s, uint32_t next_emit, uint32_t repeat, uint32_t end) {
+    for (;;) {
+        const uint32_t next = s + ((s - next_emit) >> 6) + 4u;
+        if (MINLZ_UNLIKELY(next >= end)) {
+            return (minlz_l1_8m_result){s, 0, MINLZ_L1_8M_END};
+        }
+        const uint64_t cv = minlz_load64(src + s);
+        const uint32_t w0 = (uint32_t)cv;
+        const uint32_t w1 = (uint32_t)(cv >> 8);
+        const uint32_t w2 = (uint32_t)(cv >> 16);
+        const uint32_t h0 = minlz_l1_8m_hash(cv);
+        const uint32_t h1 = minlz_l1_8m_hash(cv >> 8);
+
+        /* Read and write in probe order so aliased slots behave as before. */
+        const minlz_l1_8m_entry here = minlz_l1_8m_pack(s, w0);
+        const minlz_l1_8m_entry e0 = table[h0];
+
+        table[h0] = here;
+        const minlz_l1_8m_entry e1 = table[h1];
+        table[h1] = here;
+
+        if (w1 == minlz_load32(src + s - repeat + 1u)) {
+            return (minlz_l1_8m_result){s, 0, MINLZ_L1_8M_REPEAT};
+        }
+        /* The last two probes are shifted by up to two bytes. */
+        const uint32_t offset_limit = MINLZ_MAX_COPY3_OFFSET - 2u;
+        const uint32_t low = s > offset_limit ? s - offset_limit : 0u;
+        int first = minlz_l1_8m_find(e0, w0, low, src);
+        if (first >= 0) {
+            return (minlz_l1_8m_result){s, (uint32_t)first, MINLZ_L1_8M_MATCH};
+        }
+
+        const uint32_t h2 = minlz_l1_8m_hash(cv >> 16);
+        const minlz_l1_8m_entry e2 = table[h2];
+        table[h2] = minlz_l1_8m_pack(s + 2u, w2);
+        const int second = minlz_l1_8m_find(e1, w1, low, src);
+        if (second >= 0) {
+            return (minlz_l1_8m_result){s + 1u, (uint32_t)second, MINLZ_L1_8M_MATCH};
+        }
+        const int third = minlz_l1_8m_find(e2, w2, low, src);
+        if (third >= 0) {
+            return (minlz_l1_8m_result){s + 2u, (uint32_t)third, MINLZ_L1_8M_MATCH};
+        }
+        s = next;
+    }
+}
 __asm__(
 ".text\n"
 ".p2align 4\n"
 ".globl minlz_encode_l1_block_8m_goasm\n"
 ".type minlz_encode_l1_block_8m_goasm, @function\n"
 "minlz_encode_l1_block_8m_goasm:\n"
+"xorl %r9d, %r9d\n"
+"jmp minlz_encode_l1_block_8m_core\n"
+".size minlz_encode_l1_block_8m_goasm, .-minlz_encode_l1_block_8m_goasm\n"
+".p2align 4\n"
+".globl minlz_encode_l1_block_8m_core\n"
+".hidden minlz_encode_l1_block_8m_core\n"
+".type minlz_encode_l1_block_8m_core, @function\n"
+"minlz_encode_l1_block_8m_core:\n"
 "pushq %rbx\n"
 "pushq %r12\n"
 "pushq %r13\n"
 "pushq %r14\n"
-"subq $64, %rsp\n"
+"subq $72, %rsp\n"
 "movq %rdi, 24(%rsp)\n"
 "movq %rdx, 32(%rsp)\n"
 "movq %rcx, 40(%rsp)\n"
 "movq %r8, 48(%rsp)\n"
+"movl %r9d, 64(%rsp)\n"
 "movq 48(%rsp), %rax\n"
 "movq 24(%rsp), %rcx\n"
 "movq $0x00000400, %rdx\n"
-"movq %rax, %rbx\n"
 "pxor %xmm0, %xmm0\n"
+"testl $1, 64(%rsp)\n"
+"jz .Lminlz_l1_8m_fill_table\n"
+"movq 32(%rsp), %rbx\n"
+"movl (%rbx), %edi\n"
+"andl $0xff800000, %edi\n"
+"movd %edi, %xmm0\n"
+"pshufd $0x00, %xmm0, %xmm0\n"
+".Lminlz_l1_8m_fill_table:\n"
+"movq %rax, %rbx\n"
 ".Lminlz_l1_8m_zero_loop_encodeBlockAsm:\n"
 "movdqu %xmm0, (%rbx)\n"
 "movdqu %xmm0, 16(%rbx)\n"
@@ -52,6 +158,9 @@ __asm__(
 "movl %edx, 16(%rsp)\n"
 "movq 32(%rsp), %rbx\n"
 ".Lminlz_l1_8m_search_loop_encodeBlockAsm:\n"
+"testl $1, 64(%rsp)\n"
+"jnz .Lminlz_l1_8m_cached_search\n"
+".Lminlz_l1_8m_plain_search:\n"
 "movl %edx, %esi\n"
 "subl 12(%rsp), %esi\n"
 "shrl $0x06, %esi\n"
@@ -87,6 +196,26 @@ __asm__(
 "shrq $0x08, %r10\n"
 "cmpl %r12d, %r10d\n"
 "jne .Lminlz_l1_8m_no_repeat_found_encodeBlockAsm\n"
+"jmp .Lminlz_l1_8m_repeat_found\n"
+".Lminlz_l1_8m_cached_search:\n"
+"movq %rcx, 56(%rsp)\n"
+"movl 8(%rsp), %r9d\n"
+"movl 16(%rsp), %r8d\n"
+"movl 12(%rsp), %ecx\n"
+"movq %rbx, %rsi\n"
+"movq %rax, %rdi\n"
+"call minlz_l1_8m_scan\n"
+"movq 56(%rsp), %rcx\n"
+"movl %edx, %r8d\n"
+"movl %eax, %edx\n"
+"shrq $32, %rax\n"
+"movl %eax, %esi\n"
+"movq 48(%rsp), %rax\n"
+"testl %r8d, %r8d\n"
+"jz .Lminlz_l1_8m_emit_remainder_encodeBlockAsm\n"
+"cmpl $1, %r8d\n"
+"jne .Lminlz_l1_8m_candidate_match_encodeBlockAsm\n"
+".Lminlz_l1_8m_repeat_found:\n"
 "leal 1(%rdx), %edi\n"
 "movl 12(%rsp), %esi\n"
 "movl %edi, %r8d\n"
@@ -200,6 +329,20 @@ __asm__(
 "movq %r9, %rcx\n"
 "jmp .Lminlz_l1_8m_repeat_emit_lits_end_encodeBlockAsm\n"
 ".Lminlz_l1_8m_memmove_long_repeat_emit_lits_encodeBlockAsm:\n"
+"testl $2, 64(%rsp)\n"
+"jz .Lminlz_l1_8m_repeat_sse_copy\n"
+"cmpq $512, %rsi\n"
+"jb .Lminlz_l1_8m_repeat_sse_copy\n"
+"movq %rdi, %r11\n"
+"movq %rsi, %r10\n"
+"movq %rcx, %rdi\n"
+"movq %r8, %rsi\n"
+"movq %r10, %rcx\n"
+"rep movsb\n"
+"movq %rdi, %rcx\n"
+"movq %r11, %rdi\n"
+"jmp .Lminlz_l1_8m_repeat_emit_lits_end_encodeBlockAsm\n"
+".Lminlz_l1_8m_repeat_sse_copy:\n"
 "leaq (%rcx,%rsi,1), %r9\n"
 "movdqu (%r8), %xmm0\n"
 "movdqu 16(%r8), %xmm1\n"
@@ -363,7 +506,7 @@ __asm__(
 "cmpl %edi, (%rbx,%rsi,1)\n"
 "je .Lminlz_l1_8m_candidate3_match_encodeBlockAsm\n"
 "movl 20(%rsp), %edx\n"
-"jmp .Lminlz_l1_8m_search_loop_encodeBlockAsm\n"
+"jmp .Lminlz_l1_8m_plain_search\n"
 ".Lminlz_l1_8m_candidate3_match_encodeBlockAsm:\n"
 "addl $0x02, %edx\n"
 "jmp .Lminlz_l1_8m_candidate_match_encodeBlockAsm\n"
@@ -832,6 +975,29 @@ __asm__(
 "xorq %rax, %rax\n"
 "jmp .Lminlz_l1_8m_epilogue\n"
 ".Lminlz_l1_8m_match_nolit_dst_ok_encodeBlockAsm:\n"
+"testl $1, 64(%rsp)\n"
+"jz .Lminlz_l1_8m_plain_immediate\n"
+"movabsq $0xcf1bbcdcbf9b0000, %rsi\n"
+"movq %rdi, %r8\n"
+"movl %edi, %r14d\n"
+"shrq $16, %rdi\n"
+"movq %rdi, %r9\n"
+"imulq %rsi, %r8\n"
+"imulq %rsi, %r9\n"
+"shrq $49, %r8\n"
+"shrq $49, %r9\n"
+"leal -2(%rdx), %r10d\n"
+"andl $0xff800000, %r14d\n"
+"orl %r14d, %r10d\n"
+"movl %edi, %r13d\n"
+"andl $0xff800000, %r13d\n"
+"orl %edx, %r13d\n"
+"movl (%rax,%r9,4), %esi\n"
+"movl %r10d, (%rax,%r8,4)\n"
+"movl %r13d, (%rax,%r9,4)\n"
+"andl $0x007fffff, %esi\n"
+"jmp .Lminlz_l1_8m_immediate_ready\n"
+".Lminlz_l1_8m_plain_immediate:\n"
 "movq $0x0000cf1bbcdcbf9b, %rsi\n"
 "movq %rdi, %r8\n"
 "shrq $0x10, %rdi\n"
@@ -846,6 +1012,7 @@ __asm__(
 "movl (%rax,%r9,4), %esi\n"
 "movl %r10d, (%rax,%r8,4)\n"
 "movl %edx, (%rax,%r9,4)\n"
+".Lminlz_l1_8m_immediate_ready:\n"
 "movl %edx, %r8d\n"
 "incl %edx\n"
 "leal -2162687(%r8), %r9d\n"
@@ -1106,16 +1273,30 @@ __asm__(
 "movq %rcx, %rax\n"
 "jmp .Lminlz_l1_8m_epilogue\n"
 ".Lminlz_l1_8m_epilogue:\n"
-"addq $64, %rsp\n"
+"addq $72, %rsp\n"
 "popq %r14\n"
 "popq %r13\n"
 "popq %r12\n"
 "popq %rbx\n"
 "ret\n"
-".size minlz_encode_l1_block_8m_goasm, .-minlz_encode_l1_block_8m_goasm\n"
+".size minlz_encode_l1_block_8m_core, .-minlz_encode_l1_block_8m_core\n"
 );
+
+extern size_t minlz_encode_l1_block_8m_core(uint8_t *dst, size_t dst_cap, const uint8_t *src,
+                                        size_t src_len, uint8_t *tmp, unsigned search_flags)
+    __attribute__((visibility("hidden")));
+
+#if MINLZ_ENABLE_INTRINSICS
+__attribute__((visibility("hidden")))
+size_t minlz_encode_l1_block_8m_cached(uint8_t *dst, size_t dst_cap, const uint8_t *src,
+                                      size_t src_len, uint8_t *tmp) {
+    const unsigned search_flags = minlz_cpu_features_get()->erms ? 3u : 1u;
+    return minlz_encode_l1_block_8m_core(dst, dst_cap, src, src_len, tmp, search_flags);
+}
+#endif
 #else
-size_t minlz_encode_l1_block_8m_goasm(uint8_t *dst, size_t dst_cap, const uint8_t *src, size_t src_len, uint8_t *tmp) {
+size_t minlz_encode_l1_block_8m_goasm(uint8_t *dst, size_t dst_cap, const uint8_t *src,
+                                     size_t src_len, uint8_t *tmp) {
     (void)dst; (void)dst_cap; (void)src; (void)src_len; (void)tmp;
     return 0;
 }
